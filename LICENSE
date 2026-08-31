@@ -1,0 +1,25 @@
+mamoru-xgs-npu is a mixed-license project. Every source file carries an SPDX
+License-Identifier; this file and docs/LICENSING.md are the map, and the full
+license texts are in LICENSES/.
+
+Copyright (c) 2026 The Mamoru Project.
+(Confirm or replace the copyright holder with your preferred entity before release.)
+
+  Component                                      SPDX
+  host-driver-linux/  ........................  GPL-2.0 OR MIT
+  host-driver-freebsd/  ......................  BSD-2-Clause
+  npu-firmware/{src,switch-init,build,deploy},
+    tools/  ...................................  MIT
+  npu-firmware/forwarder/forwarder.c  ........  GPL-2.0  (Marvell; original header preserved)
+
+Files without an explicit SPDX line (docs, config) are covered by MIT.
+
+GPL-2.0 obligation: if you distribute dp_fwd (built from forwarder.c), you must
+also make its corresponding source available. forwarder.c is included here, and
+the full text is LICENSES/GPL-2.0.txt. Preserve the Marvell copyright header on
+whichever license option you elect.
+
+NOT included and NOT ours to license: the Sophos/Marvell vendor material (the NPU
+base OS, mv_armada_ep, the Marvell UIO modules, libsbsp, etc.). You supply those
+from your own appliance — see docs/VENDOR-BITS.md and docs/PROVENANCE.md. Do not
+redistribute them.

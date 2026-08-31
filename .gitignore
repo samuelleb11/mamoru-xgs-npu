@@ -1,0 +1,21 @@
+# build artifacts — nothing compiled is committed; everything builds from source
+*.o
+*.ko
+*.ko.cmd
+*.mod
+*.mod.c
+*.a
+.tmp_versions/
+modules.order
+Module.symvers
+dp_fwd
+dp_app
+dp_swcfg
+# fetched build inputs (see npu-firmware/build/env.sh) — fetched, never committed
+musdk/
+*.tar.bz2
+*.tar.gz
+aarch64--glibc--*/
+# editor / OS cruft
+.DS_Store
+*.swp
