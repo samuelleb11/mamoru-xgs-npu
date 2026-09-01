@@ -47,7 +47,15 @@ swwr() {  # DEV REG VAL
 }
 case "$1" in
   rd) swrd $(($2)) $(($3)) ;;
-  wr) swwr $(($2)) $(($3)) $(($4)); echo "wrote dev=$2 reg=$3 val=$4" ;;
+  # The trailing echo used to be the LAST command in this branch, which meant the branch
+  # ALWAYS exited 0 and swwr's return code was destroyed inside the tool -- a write that
+  # timed out on the SMI bus still printed "wrote ...". A caller could not detect it even
+  # if it checked. Failure is now loud on stderr and non-zero.
+  # NOTE: success here means THE BUS TRANSACTION COMPLETED, not that the register holds the
+  # value. Only a read-back proves that; see wv() in sw-init.sh.
+  wr) swwr $(($2)) $(($3)) $(($4)) ||
+        { echo "WRITE FAILED dev=$2 reg=$3 val=$4 (SMI busy/timeout)" >&2; exit 1; }
+      echo "wrote dev=$2 reg=$3 val=$4" ;;
   id) swrd 0x00 3 ;;
   dump) for p in 0x00 0x01 0x02 0x03 0x04 0x05 0x06 0x07 0x08 0x09 0x0a; do
           printf 'dev %s reg0(status)=%s reg3(id)=%s\n' "$p" "$(swrd $(($p)) 0)" "$(swrd $(($p)) 3)"; done ;;

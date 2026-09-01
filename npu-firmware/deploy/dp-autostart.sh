@@ -27,6 +27,23 @@ insmod mv_dmax2_uio.ko 2>/dev/null || echo "[dp-autostart] mv_dmax2_uio.ko: alre
 insmod uio_pdrv_genirq.ko of_id=generic-uio 2>/dev/null || true
 
 # --- 2. Native switch bring-up (clean-room; replaces xgs-mvl6193-init). ---
+#
+# sw-init.sh writes the front-port isolation maps FIRST and refuses to power the front PHYs if
+# it cannot verify them (see its header). It applies isolation ONCE, and that is deliberate:
+# this path execs dp_fwd directly, so after sw-init.sh returns nothing else on the NPU touches
+# the switch. There is no reprogrammer to race.
+#
+# THE APPLIANCE PATH IS DIFFERENT AND NEEDS MORE. The stock launcher hands off to armada, whose
+# UMSD_NPU comes up LATE -- well after the forwarder -- and reprograms the switch, restoring
+# stock bridging. A one-shot write there is silently undone; that is what looped a live LAN on
+# 2026-08-08. The appliance therefore runs a background re-assertion sweep
+# (platform/sophos-xgs116/npu/scripts/dp-autostart.sh in the mamoru tree) which re-reads reg 6,
+# re-asserts, and reads back forever.
+#
+# IF YOU ADD ANYTHING TO THIS PATH THAT CAN REPROGRAM THE SWITCH -- a vendor init, UMSD, a
+# second forwarder, your own tooling -- THE ONE-SHOT IS NO LONGER SUFFICIENT and you must port
+# that sweep. The absence of a sweep here is a consequence of this path's simplicity, not a
+# judgement that re-assertion is unnecessary.
 sh "$DP/sw-init.sh"
 
 # --- 3. Hand the datapath to dp_fwd (built from forwarder.c against MUSDK).
