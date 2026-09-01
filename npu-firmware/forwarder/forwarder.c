@@ -1006,6 +1006,16 @@ static int ctrl_cb(void *arg)
 static int guest_ev_cb(void *arg, enum nmp_guest_lf_type client, u8 id, u8 code, u16 indx, void *msg, u16 len)
 {
 	int ret = 0;
+	u32 swop_magic = 0;
+
+	/* Read the swop magic BEFORE anything can mutate the buffer. The #ifdef DEBUG block
+	 * below overwrites the first four bytes -- i.e. exactly the magic -- so classifying
+	 * after it would make every swop request fall through to the echo in a DEBUG build,
+	 * silently, and bring-up is precisely when someone turns DEBUG on (mamoru-d7, F7).
+	 * memcpy rather than a cast: msg is a void* with no alignment guarantee, and the
+	 * guarded-copy pattern is the one used inside dp_swop_service. */
+	if (len >= sizeof(struct dp_swop_req))
+		memcpy(&swop_magic, msg, sizeof(swop_magic));
 
 	pr_debug("guest_ev_cb was called with: client %d, id %d, code %d, indx %d len %d msg 0x%x\n",
 		 client, id, code, indx, len, *(u32 *)msg);
@@ -1033,8 +1043,7 @@ static int guest_ev_cb(void *arg, enum nmp_guest_lf_type client, u8 id, u8 code,
 		 * the link down), and a /dev/mem open + mmap during init is exactly the
 		 * kind of work that has broken it before. Lazily, the cost lands on the
 		 * first switch request, where a stall is diagnosable rather than fatal. */
-		if (len >= sizeof(struct dp_swop_req) &&
-		    ((const struct dp_swop_req *)msg)->magic == DP_SWOP_MAGIC) {
+		if (swop_magic == DP_SWOP_MAGIC) {
 			u8 rbuf[sizeof(struct dp_swop_resp)];
 			int n;
 

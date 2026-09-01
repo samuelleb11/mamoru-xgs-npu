@@ -71,7 +71,9 @@ int main(void)
 
 	/* 1. A valid request with no mapping reports NOMAP — not a silent zero. */
 	r = run(mkreq(DP_SWOP_OP_READ, 0x01, DP_SWOP_REG_STATUS, 0), sizeof(q));
-	ck(r.magic == DP_SWOP_MAGIC, "response carries magic");
+	/* NOTE: this originally asserted the REQUEST magic — i.e. the old test asserted the
+	 * very property that made an echo indistinguishable from a reply. */
+	ck(r.magic == DP_SWOP_RESP_MAGIC, "response carries the RESPONSE magic");
 	ck(r.status == DP_SWOP_E_NOMAP, "unmapped read -> E_NOMAP");
 	ck(r.op == DP_SWOP_OP_READ, "op echoed on failure");
 	ck(r.val == 0, "no data invented on failure");
@@ -134,6 +136,38 @@ int main(void)
 	r = run(mkreq(DP_SWOP_OP_PORTS, 0, 0, 0), sizeof(q));
 	ck(r.status == DP_SWOP_E_NOMAP, "unmapped PORTS -> E_NOMAP");
 	ck(r.count == 0, "failed PORTS reports count 0, not a full table");
+
+	/* 10. THE RESPONSE MUST NOT BE MISTAKABLE FOR THE REQUEST. A pre-D84 NPU echoes the
+	 *     request verbatim; if the response carried the same magic, an echo would pass
+	 *     every check and the fields would alias (status<-dev, count<-reg), so the
+	 *     PORTS call (dev=0,reg=0) read as status=0=OK. Found by mamoru-d7. */
+	ck(DP_SWOP_RESP_MAGIC != DP_SWOP_MAGIC, "response magic differs from request magic");
+	r = run(mkreq(DP_SWOP_OP_READ, 0x01, 0, 0), sizeof(q));
+	ck(r.magic == DP_SWOP_RESP_MAGIC, "response is stamped with the RESPONSE magic");
+	ck(r.magic != DP_SWOP_MAGIC, "response is NOT stamped with the request magic");
+	r = run(mkreq(DP_SWOP_OP_PORTS, 0, 0, 0), sizeof(q));
+	ck(r.magic == DP_SWOP_RESP_MAGIC, "PORTS response also carries the response magic");
+	{	/* the exact aliasing case: an echo of a dev=0,reg=0 PORTS request must not be
+		 * constructible from a real response — the magic is what makes it impossible. */
+		struct dp_swop_req echo = mkreq(DP_SWOP_OP_PORTS, 0, 0, 0);
+		ck(echo.magic != DP_SWOP_RESP_MAGIC,
+		   "an echoed PORTS request cannot masquerade as a response");
+	}
+
+	/* 11. OP_WRITE VALIDATION — the operation that can PARTITION THE SWITCH had zero
+	 *     coverage: deleting dev_is_legal() from reg_write() alone left the suite at
+	 *     40/40 green (mamoru-d7, mutation 1). Every check below is a WRITE. */
+	r = run(mkreq(DP_SWOP_OP_WRITE, 0x0b, DP_SWOP_REG_VLAN_MAP, 0x1234), sizeof(q));
+	ck(r.status == DP_SWOP_E_DEV, "WRITE dev 0x0b -> E_DEV");
+	r = run(mkreq(DP_SWOP_OP_WRITE, 0x10, DP_SWOP_REG_VLAN_MAP, 0x1234), sizeof(q));
+	ck(r.status == DP_SWOP_E_DEV, "WRITE dev 0x10 (the OLD wrong base) -> E_DEV");
+	r = run(mkreq(DP_SWOP_OP_WRITE, 0xff, 0, 0), sizeof(q));
+	ck(r.status == DP_SWOP_E_DEV, "WRITE dev 0xff -> E_DEV");
+	r = run(mkreq(DP_SWOP_OP_WRITE, 0x01, 32, 0), sizeof(q));
+	ck(r.status == DP_SWOP_E_REG, "WRITE reg 32 -> E_REG");
+	r = run(mkreq(DP_SWOP_OP_WRITE, 0x01, DP_SWOP_REG_VLAN_MAP, 0x0001), sizeof(q));
+	ck(r.status == DP_SWOP_E_NOMAP, "WRITE to a legal dev reaches the mapping check");
+	ck(r.op == DP_SWOP_OP_WRITE, "WRITE op echoed back on failure");
 
 	/* 9. NEGATIVE CONTROL — prove this harness can FAIL. Without it a green run
 	 *    says nothing: a test that cannot fail is a missing test that is trusted. */

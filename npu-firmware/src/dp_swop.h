@@ -32,10 +32,22 @@
 #ifndef DP_SWOP_H
 #define DP_SWOP_H
 
+#include <stddef.h>
 #include <stdint.h>
 
-#define DP_SWOP_MAGIC		0x53574F50u	/* "SWOP" — rejects a stray custom msg  */
+#define DP_SWOP_MAGIC		0x53574F50u	/* "SWOP" — request  */
+#define DP_SWOP_RESP_MAGIC	0x53574F52u	/* "SWOR" — response */
 #define DP_SWOP_VERSION		1u
+
+/* THE RESPONSE MAGIC MUST DIFFER FROM THE REQUEST MAGIC. This is not cosmetic.
+ * A pre-D84 NPU echoes the request back VERBATIM, so a response that shared the
+ * request magic is byte-indistinguishable from an echo — and the fields then ALIAS:
+ * resp.status lands on req.dev and resp.count on req.reg. For the PORTS call the host
+ * actually makes (dev=0, reg=0) that yields status=0=OK, i.e. an echo from firmware
+ * WITHOUT the handler was reported as SUCCESS, and the "firmware predates D84" branch
+ * was unreachable code. Measured over all 29 legal device addresses by mamoru-d7:
+ * detector fired 0 times. Distinct magics make echo detection TOTAL and independent
+ * of every other field. */
 
 /* Operations. Unknown op => DP_SWOP_E_OP, never a fallback to something plausible. */
 #define DP_SWOP_OP_READ		0x01u	/* one register                              */
@@ -79,7 +91,8 @@ struct dp_swop_port {
 };					/* 4 bytes */
 
 struct dp_swop_resp {
-	uint32_t	magic;		/* echoed DP_SWOP_MAGIC              */
+	uint32_t	magic;		/* DP_SWOP_RESP_MAGIC, never the
+					 * request magic — see above         */
 	uint8_t		version;
 	uint8_t		op;		/* echoed, so a reply cannot be
 					 * mistaken for a different one      */
@@ -92,8 +105,21 @@ struct dp_swop_resp {
 
 /* Fail the BUILD, not the wire, if either side's layout drifts. */
 #ifdef __GNUC__
-_Static_assert(sizeof(struct dp_swop_req) <= 48, "swop request exceeds AGNIC params");
-_Static_assert(sizeof(struct dp_swop_resp) <= 56, "swop response exceeds AGNIC data");
+/* EXACT, not <=. A capacity assert pins nothing: adding a field to dp_swop_req moved
+ * sizeof 12->16 with both capacity asserts still passing and the host's exact
+ * BUILD_BUG_ON in the other repo never seeing it — silent cross-repo layout drift,
+ * the precise hazard the duplication is supposed to be guarded against. */
+_Static_assert(sizeof(struct dp_swop_req) == 12, "swop request layout drifted");
+_Static_assert(sizeof(struct dp_swop_resp) == 56, "swop response layout drifted");
+/* And sizes agreeing is NOT layouts agreeing — pin the offsets that carry meaning. */
+_Static_assert(offsetof(struct dp_swop_req, op) == 5, "req.op moved");
+_Static_assert(offsetof(struct dp_swop_req, dev) == 6, "req.dev moved");
+_Static_assert(offsetof(struct dp_swop_req, reg) == 7, "req.reg moved");
+_Static_assert(offsetof(struct dp_swop_req, val) == 8, "req.val moved");
+_Static_assert(offsetof(struct dp_swop_resp, status) == 6, "resp.status moved");
+_Static_assert(offsetof(struct dp_swop_resp, count) == 7, "resp.count moved");
+_Static_assert(offsetof(struct dp_swop_resp, val) == 8, "resp.val moved");
+_Static_assert(offsetof(struct dp_swop_resp, ports) == 12, "resp.ports moved");
 #endif
 
 /* Map the SMI window. Call ONCE at startup. Returns 0, or -errno.
@@ -108,8 +134,10 @@ void dp_swop_fini(void);
  * failure can never be mistaken for a message that was never handled. Returns the
  * number of response bytes written, or -1 if resp_cap was too small for even a header.
  *
- * Bounded and non-blocking: every SMI wait is a bounded spin, so this cannot stall
- * the management pump thread it runs on. */
+ * Bounded and non-blocking: ONE transaction spends at most SPIN_BUDGET MMIO accesses
+ * in total, across every nested wait — a single shared budget, not per-loop limits that
+ * would multiply. That is what makes this safe on the management pump thread, where an
+ * unbounded wait starves the host handshake and tears the link down. */
 int dp_swop_service(const void *req, unsigned req_len, void *resp, unsigned resp_cap);
 
 #endif /* DP_SWOP_H */

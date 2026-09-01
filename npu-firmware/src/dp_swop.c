@@ -47,7 +47,13 @@
  * generous in attempts. It MUST stay bounded: this runs on dp_fwd's management pump
  * thread, and an unbounded wait there stalls the host handshake and tears the link
  * down (see forwarder.c's mng_pump_thread comment). */
-#define SPIN_LIMIT		20000
+/* ONE TOTAL BUDGET, not two nested limits. inner_wait() calls outer_wait() inside its
+ * loop, so independent bounds multiply: 20000 x 20002 is ~4e8 MMIO accesses per
+ * inner_wait, and a single reg_read performs two of those plus two outer_waits. The
+ * header claimed "bounded and non-blocking"; the arithmetic did not support it
+ * (mamoru-d7, F5). A shared decrementing budget makes the claim true by construction:
+ * whatever path is taken, one transaction costs at most SPIN_BUDGET MMIO accesses. */
+#define SPIN_BUDGET		60000u
 
 static volatile unsigned char *g_map;	/* mmap'd page, NULL when unmapped */
 static int g_fd = -1;
@@ -96,26 +102,28 @@ void dp_swop_fini(void)
 	}
 }
 
-/* Wait for the OUTER orion SMI to go idle. */
-static int outer_wait(void)
+/* Wait for the OUTER orion SMI to go idle, spending from the shared budget. */
+static int outer_wait(unsigned *budget)
 {
-	unsigned i;
-
-	for (i = 0; i < SPIN_LIMIT; i++)
+	while (*budget) {
+		(*budget)--;
 		if (!(smi_rd() & OUTER_BUSY))
 			return 0;
+	}
 	return -1;
 }
 
-/* Wait for the INNER switch SMI command register to clear its busy bit. */
-static int inner_wait(void)
+/* Wait for the INNER switch SMI command register to clear its busy bit. Shares the
+ * SAME budget as every outer_wait it performs, so the total is bounded once. */
+static int inner_wait(unsigned *budget)
 {
-	unsigned i;
-
-	for (i = 0; i < SPIN_LIMIT; i++) {
+	while (*budget) {
 		smi_wr(OUTER_RD_CMD);
-		if (outer_wait() < 0)
+		if (outer_wait(budget) < 0)
 			return -1;
+		if (!*budget)
+			return -1;
+		(*budget)--;
 		if (!(smi_rd() & INNER_BUSY))
 			return 0;
 	}
@@ -134,6 +142,7 @@ static int dev_is_legal(uint8_t dev)
 
 static uint8_t reg_read(uint8_t dev, uint8_t reg, uint16_t *out)
 {
+	unsigned budget = SPIN_BUDGET;
 	uint32_t v;
 
 	/* Validate the REQUEST before consulting hardware state. A malformed request is
@@ -146,17 +155,17 @@ static uint8_t reg_read(uint8_t dev, uint8_t reg, uint16_t *out)
 	if (!g_map)
 		return DP_SWOP_E_NOMAP;
 
-	if (inner_wait() < 0)
+	if (inner_wait(&budget) < 0)
 		return DP_SWOP_E_BUSY;
 	smi_wr(OUTER_WR_CMD_BASE | INNER_BUSY | INNER_C22 | INNER_OP_READ |
 	       ((uint32_t)dev << 5) | reg);
-	if (outer_wait() < 0)
+	if (outer_wait(&budget) < 0)
 		return DP_SWOP_E_BUSY;
-	if (inner_wait() < 0)
+	if (inner_wait(&budget) < 0)
 		return DP_SWOP_E_BUSY;
 
 	smi_wr(OUTER_RD_DATA);
-	if (outer_wait() < 0)
+	if (outer_wait(&budget) < 0)
 		return DP_SWOP_E_BUSY;
 	v = smi_rd();
 
@@ -173,6 +182,8 @@ static uint8_t reg_read(uint8_t dev, uint8_t reg, uint16_t *out)
 
 static uint8_t reg_write(uint8_t dev, uint8_t reg, uint16_t val)
 {
+	unsigned budget = SPIN_BUDGET;
+
 	if (!dev_is_legal(dev))
 		return DP_SWOP_E_DEV;
 	if (reg > 31)
@@ -180,16 +191,16 @@ static uint8_t reg_write(uint8_t dev, uint8_t reg, uint16_t val)
 	if (!g_map)
 		return DP_SWOP_E_NOMAP;
 
-	if (inner_wait() < 0)
+	if (inner_wait(&budget) < 0)
 		return DP_SWOP_E_BUSY;
 	smi_wr(OUTER_WR_DATA_BASE | val);		/* SMI data first  */
-	if (outer_wait() < 0)
+	if (outer_wait(&budget) < 0)
 		return DP_SWOP_E_BUSY;
 	smi_wr(OUTER_WR_CMD_BASE | INNER_BUSY | INNER_C22 | INNER_OP_WRITE |
 	       ((uint32_t)dev << 5) | reg);		/* then the command */
-	if (outer_wait() < 0)
+	if (outer_wait(&budget) < 0)
 		return DP_SWOP_E_BUSY;
-	if (inner_wait() < 0)
+	if (inner_wait(&budget) < 0)
 		return DP_SWOP_E_BUSY;
 	return DP_SWOP_OK;
 }
@@ -205,7 +216,7 @@ int dp_swop_service(const void *req_buf, unsigned req_len, void *resp_buf, unsig
 		return -1;			/* cannot even answer; caller's bug */
 
 	memset(&resp, 0, sizeof(resp));
-	resp.magic = DP_SWOP_MAGIC;
+	resp.magic = DP_SWOP_RESP_MAGIC;	/* NEVER the request magic — an echo must be detectable */
 	resp.version = DP_SWOP_VERSION;
 
 	if (req_len < sizeof(req)) {
