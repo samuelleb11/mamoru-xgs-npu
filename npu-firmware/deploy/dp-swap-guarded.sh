@@ -12,14 +12,32 @@
 # to be made here, on the NPU, by something that is still running when the observer
 # is gone. Same shape as the OTA boot-confirm watchdog, one layer down.
 #
-# WHAT IT DOES NOT PROMISE. Restoring the incumbent restores the NPU side only.
-# The host published its management rings once at boot (agnic P3) and the NPU
-# latches them when dp_fwd starts; whether the host re-establishes across a dp_fwd
-# restart is NOT established, so host connectivity may stay down even on a fully
-# successful restore. **Losing the host is therefore NOT evidence the candidate
-# failed.** Read RESULT before concluding anything. If the host never returns, a
-# mains power-cycle is the guaranteed recovery: /tmp is wiped, the incumbent in
-# $DP is untouched, and dp-autostart.sh runs it again from scratch.
+# MEASURED 2026-09-01 — READ THIS BEFORE RELYING ON THIS SCRIPT.
+# The open question below was tested with an IDENTICAL binary (candidate == incumbent,
+# so nothing could be blamed on new code) and the answer is: **THE HOST DOES NOT
+# SURVIVE A dp_fwd RESTART.** Both management paths (port1 and port9) stayed dark
+# through the watchdog's entire candidate-plus-restore budget, and recovery required
+# a mains power-cycle (host back at T+29s, NPU datapath clean: mgmt ECHO OK, GIU
+# configured, 9 netdevs registered).
+#
+# The cause is the one the header already suspected: the host publishes its AGNIC
+# management rings ONCE at boot (P3) and the NPU latches them when dp_fwd starts.
+# Nothing re-drives that handshake from the host side, so a restarted dp_fwd has no
+# path back to a host that is still holding its original publication.
+#
+# WHAT THAT MEANS FOR THIS SCRIPT, honestly: its rollback logic is largely MOOT
+# today. If the host is gone either way, nobody can read RESULT (tmpfs is wiped by
+# the power cycle that recovers the box), and the mains cycle performs the rollback
+# anyway by wiping /tmp and re-running the untouched incumbent. The script is kept
+# because its premise becomes true the moment the host CAN re-establish -- e.g. a
+# host-side agnic reset that re-drives P3 -- and because its refusal checks and
+# immutable-rollback reasoning stay correct. It is NOT a working deploy path today,
+# and must not be cited as one.
+#
+# PRACTICAL CONSEQUENCE FOR D84: every NPU firmware iteration costs a mains cycle.
+# ~30s, proven twice, but it has to be PLANNED rather than discovered mid-test, and
+# it means no NPU experiment can report its own result -- the verdict has to be read
+# from the host AFTER the cycle, or not at all.
 #
 # THE ROLLBACK TARGET IS IMMUTABLE, and that is not luck. The NPU rootfs is mounted
 # READ-ONLY (ext4 ro), so $DP/dp_fwd cannot be modified, truncated or replaced by
