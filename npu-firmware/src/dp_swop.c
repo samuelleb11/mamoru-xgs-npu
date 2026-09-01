@@ -180,6 +180,19 @@ static uint8_t reg_read(uint8_t dev, uint8_t reg, uint16_t *out)
 	return DP_SWOP_OK;
 }
 
+/* The WRITE allowlist. Only what D84 actually needs; everything else refused by
+ * construction. Globals are readable but NEVER writable — a VTU flush there is a
+ * switch-wide blackout, strictly worse than isolating one port.
+ *
+ * Adding a pair here is a deliberate act and needs a stated reason, because the cost
+ * of a wrong entry is a box off the network with a mains cycle as the only recovery. */
+int dp_swop_write_allowed(uint8_t dev, uint8_t reg)
+{
+	if (dev > DP_SWOP_PORT_DEV_MAX)
+		return 0;			/* Global1/Global2: read-only, always */
+	return reg == DP_SWOP_REG_VLAN_MAP;	/* reg 6 — the per-port VLAN map D84 writes */
+}
+
 static uint8_t reg_write(uint8_t dev, uint8_t reg, uint16_t val)
 {
 	unsigned budget = SPIN_BUDGET;
@@ -231,8 +244,23 @@ void dp_swop_test_set_reg_read(uint8_t (*fn)(uint8_t, uint8_t, uint16_t *))
 	g_reg_read = fn ? fn : reg_read;
 }
 #define REG_READ(d, r, o)	g_reg_read((d), (r), (o))
+
+/* Same seam for WRITE, and for the same reason one step further on: the read-back
+ * VERIFICATION (a write whose stored value differs from the requested one must report
+ * E_VERIFY, not success) is pure envelope logic, and it was unreachable because every
+ * test runs with the window unmapped — reg_write failed first and the read-back never
+ * executed. Substituting reg_write makes the verification observable without mocking
+ * the SMI transaction itself, which stays hardware-proven. */
+static uint8_t (*g_reg_write)(uint8_t, uint8_t, uint16_t) = reg_write;
+
+void dp_swop_test_set_reg_write(uint8_t (*fn)(uint8_t, uint8_t, uint16_t))
+{
+	g_reg_write = fn ? fn : reg_write;
+}
+#define REG_WRITE(d, r, v)	g_reg_write((d), (r), (v))
 #else
 #define REG_READ(d, r, o)	reg_read((d), (r), (o))
+#define REG_WRITE(d, r, v)	reg_write((d), (r), (v))
 #endif
 
 int dp_swop_service(const void *req_buf, unsigned req_len, void *resp_buf, unsigned resp_cap)
@@ -270,7 +298,43 @@ int dp_swop_service(const void *req_buf, unsigned req_len, void *resp_buf, unsig
 		break;
 
 	case DP_SWOP_OP_WRITE:
-		resp.status = reg_write(req.dev, req.reg, req.val);
+		/* ORDER MATTERS: address VALIDITY first, then write POLICY. They are
+		 * different failures and conflating them loses information — "0x0b is not a
+		 * device on this switch" and "Global1 is a real device you may not write" are
+		 * distinct answers, and a caller debugging a refusal needs to know which.
+		 * (The test caught this: an allowlist checked first reported E_WRPERM for
+		 * addresses that are simply not devices.) */
+		if (!dev_is_legal(req.dev)) {
+			resp.status = DP_SWOP_E_DEV;
+			break;
+		}
+		if (req.reg > 31) {
+			resp.status = DP_SWOP_E_REG;
+			break;
+		}
+		if (!dp_swop_write_allowed(req.dev, req.reg)) {
+			resp.status = DP_SWOP_E_WRPERM;
+			break;
+		}
+		st = REG_WRITE(req.dev, req.reg, req.val);
+		if (st != DP_SWOP_OK) {
+			resp.status = st;
+			break;
+		}
+		/* READ BACK. There is no WriteValid bit, so a returned OK means only that a
+		 * transaction completed -- never that the value landed. Reserved, read-only
+		 * and self-clearing bits also mean the stored value can legitimately differ
+		 * from the one sent. Report what the register NOW READS, and say so. */
+		st = REG_READ(req.dev, req.reg, &resp.val);
+		if (st != DP_SWOP_OK) {
+			resp.status = st;	/* wrote, but cannot confirm */
+			break;
+		}
+		/* Echo the target so a reply can never be attributed to a different write. */
+		resp.ports[0].status = ((uint16_t)req.dev << 8) | req.reg;
+		resp.ports[0].vlan_map = req.val;	/* what was REQUESTED */
+		resp.count = 1;
+		resp.status = (resp.val == req.val) ? DP_SWOP_OK : DP_SWOP_E_VERIFY;
 		break;
 
 	case DP_SWOP_OP_PORTS: {

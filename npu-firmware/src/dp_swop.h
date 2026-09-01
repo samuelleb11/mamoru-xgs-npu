@@ -19,6 +19,29 @@
  * returns 0x0000 with the SMI VALID bit SET, so the bus cannot tell you that you
  * asked the wrong question (verified on hardware 2026-09-01).
  *
+ * WRITES ARE ALLOWLISTED — see dp_swop_write_allowed(). This is the load-bearing
+ * decision of the write path, and it INVERTS the obvious design. A denylist of
+ * dangerous registers is a losing game: 13 devices x 32 registers, with a dangerous
+ * set that is large, family-specific and partly MODE-dependent. Beyond the VLAN Map
+ * named below it includes at least Port Control (PortState=Disabled stops forwarding;
+ * FrameMode on the CPU port breaks the host tagging contract), Port Control 2 (802.1Q
+ * Secure with no matching VTU entry drops ALL of a port's traffic — a mode change, not
+ * a visibly topological one), Default VLAN ID, Physical Control (ForcedLink can force
+ * the management link down), and on the GLOBAL devices a VTU flush, which under Secure
+ * mode is a switch-wide blackout rather than one port's isolation. (mamoru-d7's review.)
+ *
+ * So only the (dev,reg) pairs D84 needs are permitted; everything else is refused BY
+ * CONSTRUCTION rather than by having been thought of. An unforeseen dangerous register
+ * is refused because it was never allowed — the property a denylist cannot have.
+ * WRITES TO GLOBAL1/GLOBAL2 ARE REFUSED ENTIRELY; they remain readable.
+ *
+ * EVERY WRITE IS READ BACK. The bus offers no WriteValid bit, so "the transaction
+ * returned OK" is not "your value landed". Switch registers also carry reserved,
+ * read-only and self-clearing bits, so the value that LANDS can legitimately differ
+ * from the value SENT even on a perfect transaction. The response therefore carries
+ * the post-write register contents plus the dev/reg it acted on, and a mismatch is
+ * reported as DP_SWOP_E_VERIFY rather than success.
+ *
  * WRITE HAZARD — read this before wiring a caller.
  * A write to a Port-Based VLAN Map (reg 6) can partition the switch. The management
  * path rides a front port, so a map that isolates that port cuts the box off the
@@ -27,6 +50,17 @@
  * that guesses would be a policy in disguise. Refusing to partition management is
  * the CALLER's obligation, and it belongs in the applier where the interface map is
  * actually known.
+ *
+ * TWO LIMITS ON THAT OBLIGATION, so a caller-side guard is not written under a false
+ * sense of completeness (both from d7's review):
+ *  (a) NOTHING HERE TELLS THE CALLER WHICH PORT IS MANAGEMENT. PORTS returns
+ *      status+vlanmap per device with no indication of the CPU port or the operator's
+ *      link, so the obligation rests on board knowledge outside this contract — and a
+ *      guard that does not know which port is management cannot refuse to partition it.
+ *  (b) A PARTITION CAN BE BUILT FROM INDIVIDUALLY-SAFE WRITES. Removing the management
+ *      port from every OTHER port's map isolates it without any single write touching
+ *      its own registers. No per-write guard can see that at any allowlist quality; the
+ *      check must be against the RESULTING map, before the first write of a sequence.
  */
 
 #ifndef DP_SWOP_H
@@ -64,6 +98,8 @@
 #define DP_SWOP_E_INVALID	0x06u	/* transaction completed but ReadValid clear */
 #define DP_SWOP_E_NOMAP		0x07u	/* /dev/mem window not mapped (init failed)  */
 #define DP_SWOP_E_LEN		0x08u	/* caller passed a short buffer              */
+#define DP_SWOP_E_WRPERM	0x09u	/* (dev,reg) not on the WRITE allowlist      */
+#define DP_SWOP_E_VERIFY	0x0au	/* write landed but read-back != requested   */
 
 #define DP_SWOP_PORT_DEV_MAX	0x0au	/* port devices are 0x00..0x0a               */
 #define DP_SWOP_DEV_GLOBAL1	0x1bu
@@ -140,6 +176,10 @@ void dp_swop_fini(void);
  * unbounded wait starves the host handshake and tears the link down. */
 int dp_swop_service(const void *req, unsigned req_len, void *resp, unsigned resp_cap);
 
+/* Is (dev,reg) permitted for WRITE? Exposed so a test can drive the policy directly
+ * rather than inferring it from service() outcomes. */
+int dp_swop_write_allowed(uint8_t dev, uint8_t reg);
+
 #ifdef DP_SWOP_TEST
 /* Substitute the per-register read so the PORTS COUNT arithmetic is observable — the
  * only part of the envelope no test could reach, because every check runs with the
@@ -150,6 +190,7 @@ int dp_swop_service(const void *req, unsigned req_len, void *resp, unsigned resp
  * produced and its count checked. Absent DP_SWOP_TEST there is no pointer and no hook:
  * dp_fwd calls reg_read directly. */
 void dp_swop_test_set_reg_read(uint8_t (*fn)(uint8_t dev, uint8_t reg, uint16_t *out));
+void dp_swop_test_set_reg_write(uint8_t (*fn)(uint8_t dev, uint8_t reg, uint16_t val));
 #endif
 
 #endif /* DP_SWOP_H */

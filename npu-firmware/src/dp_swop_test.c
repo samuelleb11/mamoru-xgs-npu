@@ -63,6 +63,15 @@ static struct dp_swop_resp run(struct dp_swop_req req, unsigned req_len)
 static uint8_t stub_fail_from;
 static int stub_fail_on_vlan;
 
+/* Accepts any write and stores nothing — so the READ-BACK, not the write, decides the
+ * verdict. That is the point: a write that "succeeds" while the register keeps its old
+ * value is exactly the case with no WriteValid bit to catch it. */
+static uint8_t stub_reg_write(uint8_t dev, uint8_t reg, uint16_t val)
+{
+	(void)dev; (void)reg; (void)val;
+	return DP_SWOP_OK;
+}
+
 static uint8_t stub_reg_read(uint8_t dev, uint8_t reg, uint16_t *out)
 {
 	if (dev > stub_fail_from)
@@ -249,6 +258,61 @@ int main(void)
 		r = run(mkreq(DP_SWOP_OP_PORTS, 0, 0, 0), sizeof(q));
 		ck(r.status == DP_SWOP_E_NOMAP,
 		   "seam restored — the real reg_read is back in the path");
+	}
+
+	/* 13. THE WRITE ALLOWLIST — writes are permitted BY CONSTRUCTION, not by denylist.
+	 *     mamoru-d7's review: the dangerous set spans Port Control, Port Control 2
+	 *     (802.1Q Secure), PVID, Physical Control and both GLOBAL devices (a VTU flush
+	 *     is a switch-wide blackout). Enumerating what to refuse is a losing game. */
+	ck(dp_swop_write_allowed(0x01, DP_SWOP_REG_VLAN_MAP) == 1, "port reg6 IS writable");
+	ck(dp_swop_write_allowed(0x00, DP_SWOP_REG_VLAN_MAP) == 1, "CPU port reg6 IS writable");
+	ck(dp_swop_write_allowed(0x0a, DP_SWOP_REG_VLAN_MAP) == 1, "last port reg6 IS writable");
+	ck(dp_swop_write_allowed(0x01, 0x04) == 0, "Port Control (PortState/FrameMode) refused");
+	ck(dp_swop_write_allowed(0x01, 0x08) == 0, "Port Control 2 (802.1Q Secure) refused");
+	ck(dp_swop_write_allowed(0x01, 0x07) == 0, "Default VLAN ID refused");
+	ck(dp_swop_write_allowed(0x01, 0x01) == 0, "Physical Control (ForcedLink) refused");
+	ck(dp_swop_write_allowed(DP_SWOP_DEV_GLOBAL1, DP_SWOP_REG_VLAN_MAP) == 0,
+	   "Global1 refused for WRITE even at an allowlisted reg");
+	ck(dp_swop_write_allowed(DP_SWOP_DEV_GLOBAL2, DP_SWOP_REG_VLAN_MAP) == 0,
+	   "Global2 refused for WRITE even at an allowlisted reg");
+	{	/* globals stay READABLE — the allowlist restricts writes only */
+		struct dp_swop_resp g = run(mkreq(DP_SWOP_OP_READ, DP_SWOP_DEV_GLOBAL1, 0, 0),
+					    sizeof(q));
+		ck(g.status == DP_SWOP_E_NOMAP, "Global1 remains READABLE (reached the mapping check)");
+	}
+	/* through service(): VALIDITY is answered before POLICY, so the two stay distinct */
+	r = run(mkreq(DP_SWOP_OP_WRITE, DP_SWOP_DEV_GLOBAL1, DP_SWOP_REG_VLAN_MAP, 1), sizeof(q));
+	ck(r.status == DP_SWOP_E_WRPERM, "WRITE to Global1 -> E_WRPERM (a real device, not writable)");
+	r = run(mkreq(DP_SWOP_OP_WRITE, 0x01, 0x04, 1), sizeof(q));
+	ck(r.status == DP_SWOP_E_WRPERM, "WRITE to a non-allowlisted reg -> E_WRPERM");
+	r = run(mkreq(DP_SWOP_OP_WRITE, 0x0b, DP_SWOP_REG_VLAN_MAP, 1), sizeof(q));
+	ck(r.status == DP_SWOP_E_DEV, "WRITE to a NON-DEVICE is still E_DEV, not E_WRPERM");
+
+	/* 14. READ-BACK VERIFICATION — there is no WriteValid bit, so "the transaction
+	 *     returned OK" is not "your value landed". Reserved/read-only/self-clearing
+	 *     bits mean the stored value can legitimately differ from the one sent, and
+	 *     without a read-back nothing would ever show it. (mamoru-d7, W1.) */
+	{
+		struct dp_swop_resp w;
+
+		stub_fail_from = 0xff;		/* never fail; return derived values */
+		stub_fail_on_vlan = 0;
+		dp_swop_test_set_reg_read(stub_reg_read);
+		dp_swop_test_set_reg_write(stub_reg_write);	/* accepts, changes nothing */
+		/* the stub returns 0xC00d for a VLAN_MAP read, which will NOT equal what we
+		 * ask to write — so a correct implementation must report a MISMATCH. */
+		w = run(mkreq(DP_SWOP_OP_WRITE, 0x01, DP_SWOP_REG_VLAN_MAP, 0x0001), sizeof(q));
+		ck(w.status == DP_SWOP_E_VERIFY,
+		   "write whose read-back differs is E_VERIFY, NOT success");
+		ck(w.val == 0xC001, "the response carries what the register NOW READS");
+		ck(w.ports[0].status == ((0x01u << 8) | DP_SWOP_REG_VLAN_MAP),
+		   "the response names the dev/reg it acted on");
+		ck(w.ports[0].vlan_map == 0x0001, "the response also carries what was REQUESTED");
+		/* and the agreeing case must pass: ask for exactly what the stub will return */
+		w = run(mkreq(DP_SWOP_OP_WRITE, 0x01, DP_SWOP_REG_VLAN_MAP, 0xC001), sizeof(q));
+		ck(w.status == DP_SWOP_OK, "write whose read-back AGREES is OK");
+		dp_swop_test_set_reg_read(NULL);
+		dp_swop_test_set_reg_write(NULL);
 	}
 
 	/* 9. NEGATIVE CONTROL — prove this harness can FAIL. Without it a green run
