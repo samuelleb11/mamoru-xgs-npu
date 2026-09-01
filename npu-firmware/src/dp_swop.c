@@ -267,6 +267,7 @@ int dp_swop_service(const void *req_buf, unsigned req_len, void *resp_buf, unsig
 {
 	struct dp_swop_req req;
 	struct dp_swop_resp resp;
+	uint16_t pre = 0;
 	unsigned out_len;
 	uint8_t st;
 
@@ -316,6 +317,17 @@ int dp_swop_service(const void *req_buf, unsigned req_len, void *resp_buf, unsig
 			resp.status = DP_SWOP_E_WRPERM;
 			break;
 		}
+		/* PRE-READ. The post-write comparison is blind when the register ALREADY
+		 * held the requested value: it succeeds with no evidence the write reached
+		 * the intended device. Observing a CHANGE is the only thing that proves the
+		 * addressed register responded. (mamoru-43 found this for the zero case —
+		 * a wrong-but-legal device returns valid=1 data=0x0000, and reg6=0x000 is a
+		 * plausible D84 operation — but it generalises to any already-present value.) */
+		st = REG_READ(req.dev, req.reg, &pre);
+		if (st != DP_SWOP_OK) {
+			resp.status = st;	/* cannot establish a baseline; do not write */
+			break;
+		}
 		st = REG_WRITE(req.dev, req.reg, req.val);
 		if (st != DP_SWOP_OK) {
 			resp.status = st;
@@ -334,7 +346,15 @@ int dp_swop_service(const void *req_buf, unsigned req_len, void *resp_buf, unsig
 		resp.ports[0].status = ((uint16_t)req.dev << 8) | req.reg;
 		resp.ports[0].vlan_map = req.val;	/* what was REQUESTED */
 		resp.count = 1;
-		resp.status = (resp.val == req.val) ? DP_SWOP_OK : DP_SWOP_E_VERIFY;
+		if (resp.val != req.val)
+			resp.status = DP_SWOP_E_VERIFY;
+		else if (pre == req.val)
+			/* Agrees, but nothing moved — unverifiable rather than failed. Not an
+			 * error: a caller that means to write a value already present may
+			 * accept it. It simply must not be told the write was CONFIRMED. */
+			resp.status = DP_SWOP_W_NOCHANGE;
+		else
+			resp.status = DP_SWOP_OK;	/* a real change was observed */
 		break;
 
 	case DP_SWOP_OP_PORTS: {

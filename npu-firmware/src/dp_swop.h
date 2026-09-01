@@ -35,6 +35,23 @@
  * is refused because it was never allowed — the property a denylist cannot have.
  * WRITES TO GLOBAL1/GLOBAL2 ARE REFUSED ENTIRELY; they remain readable.
  *
+ * A WRITE THAT CHANGES NOTHING PROVES NOTHING — DP_SWOP_W_NOCHANGE.
+ * The read-back compares the post-write value against the requested one. That test is
+ * blind in exactly one case: when the register ALREADY held the requested value, the
+ * comparison succeeds without any evidence the write reached the intended device.
+ * mamoru-43 found this for the zero case, which is the likely one — the 2026-09-01
+ * base-address bug returned valid=1 with data=0x0000 from a WRONG device, and
+ * `reg6 = 0x000` (isolate a port completely) is a plausible D84 operation, so a write
+ * of zero to a wrong-but-legal device reads back zero and looks correct. The general
+ * form is broader than zero: ANY value that the addressed register already holds is
+ * indistinguishable from a write that landed elsewhere on a register holding the same.
+ * And the obvious prober cannot help — reg 3 reads 0x1930 at EVERY device address, so
+ * it cannot discriminate one device from another.
+ *
+ * So the handler pre-reads, and reports W_NOCHANGE rather than OK when the value did
+ * not move. That is not a failure; it is a refusal to claim evidence that does not
+ * exist. A caller that genuinely wants to write a value already present can accept it.
+ *
  * EVERY WRITE IS READ BACK. The bus offers no WriteValid bit, so "the transaction
  * returned OK" is not "your value landed". Switch registers also carry reserved,
  * read-only and self-clearing bits, so the value that LANDS can legitimately differ
@@ -42,8 +59,26 @@
  * the post-write register contents plus the dev/reg it acted on, and a mismatch is
  * reported as DP_SWOP_E_VERIFY rather than success.
  *
- * WRITE HAZARD — read this before wiring a caller.
- * A write to a Port-Based VLAN Map (reg 6) can partition the switch. The management
+ * WRITE HAZARD — PRECONDITION, not a note. reg 6 HAS AN INCIDENT.
+ * On 2026-08-08 a port brought up before its VLAN map was written egressed to every
+ * other front port and BRIDGED A CUSTOMER'S NETWORKS INSIDE THE SWITCH, looping a live
+ * LAN. Not hypothetical: port 9 was later found holding reg6=0x05ff on the live box
+ * while every other front port held 0x001 (HARDWARE.md, sw-init.sh).
+ *
+ * The bring-up path's protection is ORDERING — maps written before phyup. **That
+ * protection is structurally unavailable to D84**, which writes reg 6 on ports that are
+ * ALREADY UP: every D84 write happens in exactly the state the ordering rule exists to
+ * avoid. The allowlist guards the ADDRESS; this incident is about the VALUE, and
+ * `0x7fe` on a front port is a perfectly well-formed reg-6 write that bridges every
+ * front port. (mamoru-43's second read.)
+ *
+ * THEREFORE: a caller MUST validate the RESULTING map — the whole port vector set it
+ * intends to leave behind — BEFORE issuing the first write of a sequence. Per-write
+ * validation cannot see this, in either direction: a bridge assembled from
+ * individually-well-formed values, or a partition assembled from individually-safe
+ * ones (d7's W5). This is a precondition on the caller, not advice.
+ *
+ * A write to a Port-Based VLAN Map (reg 6) can also partition the switch. The management
  * path rides a front port, so a map that isolates that port cuts the box off the
  * network, and recovery is then a MAINS cycle. This module deliberately does NOT
  * encode which port is "management" — the NPU does not know that, and a mechanism
@@ -100,6 +135,8 @@
 #define DP_SWOP_E_LEN		0x08u	/* caller passed a short buffer              */
 #define DP_SWOP_E_WRPERM	0x09u	/* (dev,reg) not on the WRITE allowlist      */
 #define DP_SWOP_E_VERIFY	0x0au	/* write landed but read-back != requested   */
+#define DP_SWOP_W_NOCHANGE	0x0bu	/* read-back agrees, but NOTHING CHANGED —
+					 * the write is UNVERIFIABLE, see below      */
 
 #define DP_SWOP_PORT_DEV_MAX	0x0au	/* port devices are 0x00..0x0a               */
 #define DP_SWOP_DEV_GLOBAL1	0x1bu

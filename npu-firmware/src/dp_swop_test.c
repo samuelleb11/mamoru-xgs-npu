@@ -66,9 +66,22 @@ static int stub_fail_on_vlan;
 /* Accepts any write and stores nothing — so the READ-BACK, not the write, decides the
  * verdict. That is the point: a write that "succeeds" while the register keeps its old
  * value is exactly the case with no WriteValid bit to catch it. */
+/* A STATEFUL stub: a write is remembered so the read-back sees it. That is what makes
+ * the CHANGE-vs-NO-CHANGE distinction testable — with a constant-returning stub every
+ * write looks like a no-op and the OK path is unreachable. */
+static int stub_store_active;
+static uint8_t stub_store_dev, stub_store_reg;
+static uint16_t stub_store_val;
+static uint16_t stub_store_mask = 0xffff;	/* bits the register actually keeps */
+
 static uint8_t stub_reg_write(uint8_t dev, uint8_t reg, uint16_t val)
 {
-	(void)dev; (void)reg; (void)val;
+	stub_store_active = 1;
+	stub_store_dev = dev; stub_store_reg = reg;
+	/* Real switch registers carry reserved, read-only and self-clearing bits, so the
+	 * value that LANDS can legitimately differ from the value SENT even on a perfect
+	 * transaction. The mask models exactly that — it is why read-back exists. */
+	stub_store_val = (uint16_t)(val & stub_store_mask);
 	return DP_SWOP_OK;
 }
 
@@ -81,6 +94,10 @@ static uint8_t stub_reg_read(uint8_t dev, uint8_t reg, uint16_t *out)
 			return DP_SWOP_E_BUSY;
 		if (reg == DP_SWOP_REG_VLAN_MAP)
 			return DP_SWOP_E_BUSY;
+	}
+	if (stub_store_active && dev == stub_store_dev && reg == stub_store_reg) {
+		*out = stub_store_val;		/* the write is visible to the read-back */
+		return DP_SWOP_OK;
 	}
 	*out = (uint16_t)((reg == DP_SWOP_REG_VLAN_MAP ? 0xC000 : 0xB000) | dev);
 	return DP_SWOP_OK;
@@ -299,18 +316,40 @@ int main(void)
 		stub_fail_on_vlan = 0;
 		dp_swop_test_set_reg_read(stub_reg_read);
 		dp_swop_test_set_reg_write(stub_reg_write);	/* accepts, changes nothing */
-		/* the stub returns 0xC00d for a VLAN_MAP read, which will NOT equal what we
-		 * ask to write — so a correct implementation must report a MISMATCH. */
-		w = run(mkreq(DP_SWOP_OP_WRITE, 0x01, DP_SWOP_REG_VLAN_MAP, 0x0001), sizeof(q));
+		/* A register with READ-ONLY bits: we ask for 0x0FF1, it keeps only 0x00FF,
+		 * so the read-back legitimately differs from the request. That must be
+		 * E_VERIFY, not success — it is the whole reason read-back exists. */
+		stub_store_active = 0;
+		stub_store_mask = 0x00ff;
+		w = run(mkreq(DP_SWOP_OP_WRITE, 0x01, DP_SWOP_REG_VLAN_MAP, 0x0ff1), sizeof(q));
 		ck(w.status == DP_SWOP_E_VERIFY,
 		   "write whose read-back differs is E_VERIFY, NOT success");
-		ck(w.val == 0xC001, "the response carries what the register NOW READS");
+		ck(w.val == 0x00f1, "the response carries what the register NOW READS");
+		stub_store_mask = 0xffff;
 		ck(w.ports[0].status == ((0x01u << 8) | DP_SWOP_REG_VLAN_MAP),
 		   "the response names the dev/reg it acted on");
-		ck(w.ports[0].vlan_map == 0x0001, "the response also carries what was REQUESTED");
-		/* and the agreeing case must pass: ask for exactly what the stub will return */
+		ck(w.ports[0].vlan_map == 0x0ff1, "the response also carries what was REQUESTED");
+		/* A REAL CHANGE: pre=0xC001 (derived), write 0x0001, read-back sees it. */
+		stub_store_active = 0;
+		w = run(mkreq(DP_SWOP_OP_WRITE, 0x01, DP_SWOP_REG_VLAN_MAP, 0x0001), sizeof(q));
+		ck(w.status == DP_SWOP_OK, "a write that CHANGES the register is OK");
+		ck(w.val == 0x0001, "the read-back shows the new value");
+
+		/* NO CHANGE: the register already holds the requested value, so the
+		 * comparison succeeds with no evidence the write reached the intended
+		 * device — reported as W_NOCHANGE, never OK. (mamoru-43, generalised from
+		 * the zero case: a wrong-but-legal device returns 0x0000 and reg6=0x000 is
+		 * a plausible D84 write.) */
+		stub_store_active = 0;
 		w = run(mkreq(DP_SWOP_OP_WRITE, 0x01, DP_SWOP_REG_VLAN_MAP, 0xC001), sizeof(q));
-		ck(w.status == DP_SWOP_OK, "write whose read-back AGREES is OK");
+		ck(w.status == DP_SWOP_W_NOCHANGE,
+		   "a write that changes NOTHING is W_NOCHANGE, not OK");
+		/* the zero case specifically, since that is the one with a real bug behind it */
+		stub_store_active = 0;
+		stub_fail_from = 0xff;
+		w = run(mkreq(DP_SWOP_OP_WRITE, 0x02, DP_SWOP_REG_VLAN_MAP, 0xC002), sizeof(q));
+		ck(w.status == DP_SWOP_W_NOCHANGE, "same-value write on another port is also W_NOCHANGE");
+		stub_store_active = 0;
 		dp_swop_test_set_reg_read(NULL);
 		dp_swop_test_set_reg_write(NULL);
 	}
