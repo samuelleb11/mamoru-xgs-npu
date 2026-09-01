@@ -140,4 +140,16 @@ void dp_swop_fini(void);
  * unbounded wait starves the host handshake and tears the link down. */
 int dp_swop_service(const void *req, unsigned req_len, void *resp, unsigned resp_cap);
 
+#ifdef DP_SWOP_TEST
+/* Substitute the per-register read so the PORTS COUNT arithmetic is observable — the
+ * only part of the envelope no test could reach, because every check runs with the
+ * window unmapped and the scan therefore always dies at d=0. Pass NULL to restore.
+ *
+ * This does NOT mock the SMI transaction (hardware-proven; a mock there would only
+ * assert this file agrees with itself). It exists solely so a PARTIAL table can be
+ * produced and its count checked. Absent DP_SWOP_TEST there is no pointer and no hook:
+ * dp_fwd calls reg_read directly. */
+void dp_swop_test_set_reg_read(uint8_t (*fn)(uint8_t dev, uint8_t reg, uint16_t *out));
+#endif
+
 #endif /* DP_SWOP_H */

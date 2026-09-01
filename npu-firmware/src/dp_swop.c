@@ -205,6 +205,36 @@ static uint8_t reg_write(uint8_t dev, uint8_t reg, uint16_t val)
 	return DP_SWOP_OK;
 }
 
+/*
+ * TEST SEAM — compiled out entirely unless DP_SWOP_TEST is defined.
+ *
+ * The PORTS count logic (how many entries are valid when a scan dies part-way) is pure
+ * ENVELOPE logic, and it was the one part of this file no test could reach: every check
+ * runs with the window unmapped, so the loop always dies at d=0 and a count between 1
+ * and 10 was never produced. A mutation making a genuine partial claim to be a FULL
+ * table passed the whole suite (mamoru-d7, F4).
+ *
+ * This is deliberately NOT a mock of the SMI transaction — that is hardware-proven and
+ * a mock would only assert this file agrees with itself. It substitutes reg_read so the
+ * COUNT arithmetic above it becomes observable, which is exactly what this file claims
+ * to cover.
+ *
+ * The indirection does not exist in a shipping build: without DP_SWOP_TEST the macro
+ * expands to the direct call, so dp_fwd carries no function pointer to divert and no
+ * hook to reach. build_fwd.sh never defines it.
+ */
+#ifdef DP_SWOP_TEST
+static uint8_t (*g_reg_read)(uint8_t, uint8_t, uint16_t *) = reg_read;
+
+void dp_swop_test_set_reg_read(uint8_t (*fn)(uint8_t, uint8_t, uint16_t *))
+{
+	g_reg_read = fn ? fn : reg_read;
+}
+#define REG_READ(d, r, o)	g_reg_read((d), (r), (o))
+#else
+#define REG_READ(d, r, o)	reg_read((d), (r), (o))
+#endif
+
 int dp_swop_service(const void *req_buf, unsigned req_len, void *resp_buf, unsigned resp_cap)
 {
 	struct dp_swop_req req;
@@ -247,13 +277,13 @@ int dp_swop_service(const void *req_buf, unsigned req_len, void *resp_buf, unsig
 		uint8_t d;
 
 		for (d = 0; d < DP_SWOP_PORT_COUNT; d++) {
-			st = reg_read(d, DP_SWOP_REG_STATUS, &resp.ports[d].status);
+			st = REG_READ(d, DP_SWOP_REG_STATUS, &resp.ports[d].status);
 			if (st != DP_SWOP_OK) {
 				resp.status = st;
 				resp.count = d;	/* how many are actually valid */
 				goto out;
 			}
-			st = reg_read(d, DP_SWOP_REG_VLAN_MAP, &resp.ports[d].vlan_map);
+			st = REG_READ(d, DP_SWOP_REG_VLAN_MAP, &resp.ports[d].vlan_map);
 			if (st != DP_SWOP_OK) {
 				resp.status = st;
 				resp.count = d;

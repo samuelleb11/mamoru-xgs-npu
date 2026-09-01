@@ -12,8 +12,18 @@
  * only assert that this file agrees with itself. Stated plainly so a green run is
  * never read as "the switch access works".
  *
- *   cc -Wall -Wextra -Werror -o dp_swop_test dp_swop_test.c dp_swop.c && ./dp_swop_test
+ *   cc -Wall -Wextra -Werror -DDP_SWOP_TEST -o dp_swop_test dp_swop_test.c dp_swop.c \
+ *     && ./dp_swop_test
+ *
+ * -DDP_SWOP_TEST enables the reg_read seam used by section 12 (the PORTS count checks)
+ * and NOTHING else. It is never defined by build_fwd.sh, so the shipping dp_fwd has no
+ * seam to divert. This file REQUIRES it — see the #error below, which exists so a build
+ * with the old command line says what to add rather than failing on a missing symbol.
  */
+
+#ifndef DP_SWOP_TEST
+#error "build this file with -DDP_SWOP_TEST (section 12 needs the reg_read seam)"
+#endif
 
 #include "dp_swop.h"
 
@@ -41,6 +51,30 @@ static struct dp_swop_resp run(struct dp_swop_req req, unsigned req_len)
 	n = dp_swop_service(&req, req_len, &resp, sizeof(resp));
 	ck(n == (int)sizeof(resp), "service returned a full response");
 	return resp;
+}
+
+/*
+ * Substitute register read, installed only for the PORTS count checks (section 12).
+ * Succeeds for every device below `stub_fail_from`, returning a per-port value derived
+ * from the device number so an entry cannot pass by holding a coincidental zero, then
+ * fails with E_BUSY. `stub_fail_on_vlan` makes the failure land on the port's SECOND
+ * read instead of its first — the case where an entry is already half-written.
+ */
+static uint8_t stub_fail_from;
+static int stub_fail_on_vlan;
+
+static uint8_t stub_reg_read(uint8_t dev, uint8_t reg, uint16_t *out)
+{
+	if (dev > stub_fail_from)
+		return DP_SWOP_E_BUSY;
+	if (dev == stub_fail_from) {
+		if (!stub_fail_on_vlan)
+			return DP_SWOP_E_BUSY;
+		if (reg == DP_SWOP_REG_VLAN_MAP)
+			return DP_SWOP_E_BUSY;
+	}
+	*out = (uint16_t)((reg == DP_SWOP_REG_VLAN_MAP ? 0xC000 : 0xB000) | dev);
+	return DP_SWOP_OK;
 }
 
 static struct dp_swop_req mkreq(uint8_t op, uint8_t dev, uint8_t reg, uint16_t val)
@@ -168,6 +202,54 @@ int main(void)
 	r = run(mkreq(DP_SWOP_OP_WRITE, 0x01, DP_SWOP_REG_VLAN_MAP, 0x0001), sizeof(q));
 	ck(r.status == DP_SWOP_E_NOMAP, "WRITE to a legal dev reaches the mapping check");
 	ck(r.op == DP_SWOP_OP_WRITE, "WRITE op echoed back on failure");
+
+	/* 12. THE PARTIAL PORTS TABLE — the count arithmetic, which until now no check
+	 *     could reach. Unmapped, the scan always dies at d=0, so a count between 1 and
+	 *     10 was never produced and a mutation making a PARTIAL claim to be a FULL
+	 *     table passed the entire suite (mamoru-d7, F4). The seam substitutes reg_read
+	 *     ONLY — the SMI transaction is still untested here, and deliberately so. */
+	{
+		struct dp_swop_resp p;
+
+		/* (a) a scan that dies on the STATUS read of port 5 reports exactly 5. */
+		stub_fail_from = 5;
+		stub_fail_on_vlan = 0;
+		dp_swop_test_set_reg_read(stub_reg_read);
+		p = run(mkreq(DP_SWOP_OP_PORTS, 0, 0, 0), sizeof(q));
+		ck(p.status == DP_SWOP_E_BUSY, "partial PORTS reports the failing read's status");
+		ck(p.count == 5, "partial PORTS reports count 5");
+		ck(p.count != DP_SWOP_PORT_COUNT, "a PARTIAL table does not claim to be FULL");
+		ck(p.ports[4].status == 0xB004 && p.ports[4].vlan_map == 0xC004,
+		   "the entries below the count carry real data");
+		ck(p.ports[5].status == 0 && p.ports[5].vlan_map == 0,
+		   "the entry the scan died on is left zeroed, not half-filled");
+
+		/* (b) dying on the VLAN_MAP read of port 5 — its status was already written,
+		 *     so the count MUST still exclude it or a half-filled entry ships. */
+		stub_fail_from = 5;
+		stub_fail_on_vlan = 1;
+		p = run(mkreq(DP_SWOP_OP_PORTS, 0, 0, 0), sizeof(q));
+		ck(p.count == 5, "a port whose SECOND read failed is excluded from the count");
+		ck(p.ports[5].vlan_map == 0, "...and its vlan_map was never invented");
+
+		/* (c) the full-success path, which unmapped could never be reached either. */
+		stub_fail_from = DP_SWOP_PORT_COUNT;
+		stub_fail_on_vlan = 0;
+		p = run(mkreq(DP_SWOP_OP_PORTS, 0, 0, 0), sizeof(q));
+		ck(p.status == DP_SWOP_OK, "a complete scan reports OK");
+		ck(p.count == DP_SWOP_PORT_COUNT, "a complete scan reports all 11 ports");
+		ck(p.ports[10].status == 0xB00A, "the last port carries its data");
+
+		/* (d) failing on the very first read still reports 0, not a full table. */
+		stub_fail_from = 0;
+		p = run(mkreq(DP_SWOP_OP_PORTS, 0, 0, 0), sizeof(q));
+		ck(p.count == 0, "a scan that read nothing reports 0");
+
+		dp_swop_test_set_reg_read(NULL);	/* restore the real read */
+		r = run(mkreq(DP_SWOP_OP_PORTS, 0, 0, 0), sizeof(q));
+		ck(r.status == DP_SWOP_E_NOMAP,
+		   "seam restored — the real reg_read is back in the path");
+	}
 
 	/* 9. NEGATIVE CONTROL — prove this harness can FAIL. Without it a green run
 	 *    says nothing: a test that cannot fail is a missing test that is trusted. */
