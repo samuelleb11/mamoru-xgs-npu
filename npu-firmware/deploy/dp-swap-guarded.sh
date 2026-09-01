@@ -34,8 +34,14 @@
 # storage (the appliance's built-in NPU flasher), which is a separate mechanism with a
 # separate proof. Do not mistake a working /tmp swap for a deployable one.
 #
-#   usage: setsid nohup sh dp-swap-guarded.sh /tmp/dp_fwd.new > /dev/null 2>&1 &
+#   usage: setsid nohup sh dp-swap-guarded.sh /tmp/cand/dp_fwd > /dev/null 2>&1 &
 #          (detached ON PURPOSE — it must outlive the console that launched it)
+#
+#   THE CANDIDATE FILE MUST BE NAMED dp_fwd, in its own directory. Stopping is done
+#   by process NAME (killall/pidof dp_fwd), so a candidate called dp_fwd.new would be
+#   INVISIBLE to the rollback: the script could not stop a failed candidate before
+#   restarting the incumbent, and both would run at once. Naming it dp_fwd in a
+#   separate directory keeps the name-based stop correct for either binary.
 #
 #   env: DP        deploy dir holding the incumbent dp_fwd  (default /opt/dp)
 #        DEADLINE  seconds to wait for readiness            (default 60)
