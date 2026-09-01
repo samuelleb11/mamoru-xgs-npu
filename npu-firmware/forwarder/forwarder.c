@@ -103,6 +103,12 @@
 #include <sys/time.h>
 
 #include "mv_std.h"
+/* D84 switch-register handler. Included as a SINGLE TRANSLATION UNIT because the MUSDK
+ * app makefile builds exactly one .c for pkt_echo, and adding an object would mean
+ * patching the vendor autotools build -- far more fragile than this. dp_swop.c is still
+ * compiled and unit-tested STANDALONE on the host (src/dp_swop_test.c, 40 checks incl.
+ * mutation controls), so this is a link-time convenience, not a testing shortcut. */
+#include "dp_swop.c"
 #include "lib/lib_misc.h"
 #include "lib/file_utils.h"
 #include "env/mv_sys_dma.h"
@@ -1009,8 +1015,39 @@ static int guest_ev_cb(void *arg, enum nmp_guest_lf_type client, u8 id, u8 code,
 
 	pr_debug("guest_ev_cb Sent Notification msg 0x%x\n", *(u32 *)msg);
 
-	if (client == NMP_GUEST_LF_T_CUSTOM)
+	if (client == NMP_GUEST_LF_T_CUSTOM) {
+		/* D84: a custom message carrying the SWOP magic is a switch-register
+		 * operation; anything else keeps the historical verbatim echo.
+		 *
+		 * The echo is NOT legacy cruft to be tidied away -- the host driver's A0.1
+		 * probe proves the custom channel is live by sending a position-dependent
+		 * pattern and requiring it back byte-for-byte. Dispatching on the magic
+		 * keeps that probe meaningful while adding the register path beside it, so
+		 * "the channel works" and "the handler works" stay separately observable.
+		 * If they shared one path, a broken handler and a dead channel would look
+		 * the same from the host.
+		 *
+		 * dp_swop_init() is idempotent and called lazily here rather than at
+		 * startup ON PURPOSE: the management pump's timing is delicate (see
+		 * mng_pump_thread below -- starving it fails the host's P3a ECHO and tears
+		 * the link down), and a /dev/mem open + mmap during init is exactly the
+		 * kind of work that has broken it before. Lazily, the cost lands on the
+		 * first switch request, where a stall is diagnosable rather than fatal. */
+		if (len >= sizeof(struct dp_swop_req) &&
+		    ((const struct dp_swop_req *)msg)->magic == DP_SWOP_MAGIC) {
+			u8 rbuf[sizeof(struct dp_swop_resp)];
+			int n;
+
+			(void)dp_swop_init();	/* status surfaces as E_NOMAP in the reply */
+			n = dp_swop_service(msg, len, rbuf, sizeof(rbuf));
+			if (n > 0)
+				return nmp_guest_send_msg(garg.nmp_guest, code, indx,
+							  rbuf, (u16)n);
+			/* Could not even form a reply: fall through to the echo rather
+			 * than leaving the host waiting on a response that never comes. */
+		}
 		ret = nmp_guest_send_msg(garg.nmp_guest, code, indx, msg, len);
+	}
 
 	return ret;
 }
