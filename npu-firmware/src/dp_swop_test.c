@@ -354,6 +354,59 @@ int main(void)
 		dp_swop_test_set_reg_write(NULL);
 	}
 
+	/* 15. OP_READ's SUCCESS PATH — which until the seam fix could not be reached at all.
+	 *
+	 *      Every OP_READ check above asserts E_NOMAP or a validation refusal, because
+	 *      dp_swop_service() called `reg_read` directly instead of the REG_READ seam, so
+	 *      substituting a stub had no effect on this op. The suite therefore proved that a
+	 *      READ is *rejected* correctly and never that it *works*.
+	 *
+	 *      This is the op A0.2's hardware control depends on, so "no coverage" was the
+	 *      wrong place for it to be. */
+	{
+		struct dp_swop_resp p;
+
+		stub_fail_from = 0xff;		/* never fail */
+		stub_fail_on_vlan = 0;
+		stub_store_active = 0;
+		dp_swop_test_set_reg_read(stub_reg_read);
+
+		/* A successful read returns the register's value in resp.val, with OK. */
+		p = run(mkreq(DP_SWOP_OP_READ, 0x03, DP_SWOP_REG_STATUS, 0), sizeof(q));
+		ck(p.status == DP_SWOP_OK, "OP_READ success: status OK");
+		ck(p.val == 0xB003, "OP_READ success: resp.val carries the register value");
+		ck(p.op == DP_SWOP_OP_READ, "OP_READ success: op echoed");
+		ck(p.magic == DP_SWOP_RESP_MAGIC, "OP_READ success: response magic, not request");
+
+		/* A DIFFERENT register on the same device returns a DIFFERENT value. Without
+		 * this the assertion above would pass against a stub that ignored its
+		 * arguments -- i.e. against exactly the constant-returning implementation the
+		 * #74 bar exists to reject. */
+		p = run(mkreq(DP_SWOP_OP_READ, 0x03, DP_SWOP_REG_VLAN_MAP, 0), sizeof(q));
+		ck(p.status == DP_SWOP_OK, "OP_READ vlan-map: status OK");
+		ck(p.val == 0xC003, "OP_READ is a function of the REGISTER it was asked for");
+
+		/* And a different DEVICE likewise, so the dev argument is proven to reach the
+		 * read rather than being dropped. */
+		p = run(mkreq(DP_SWOP_OP_READ, 0x07, DP_SWOP_REG_STATUS, 0), sizeof(q));
+		ck(p.val == 0xB007, "OP_READ is a function of the DEVICE it was asked for");
+
+		/* A failing read reports the failure and does NOT report a value. */
+		stub_fail_from = 0x05;
+		p = run(mkreq(DP_SWOP_OP_READ, 0x06, DP_SWOP_REG_STATUS, 0), sizeof(q));
+		ck(p.status == DP_SWOP_E_BUSY, "OP_READ failure: the read's status is reported");
+		ck(p.val == 0, "OP_READ failure: no value is invented");
+
+		stub_fail_from = 0xff;
+		dp_swop_test_set_reg_read(NULL);	/* restore the real read */
+
+		/* POSITIVE CONTROL for the restore: with the seam back, a legal address again
+		 * reaches the unmapped window. If this regressed to OK, the stub would still be
+		 * installed and every later check in this file would be testing the mock. */
+		p = run(mkreq(DP_SWOP_OP_READ, 0x03, DP_SWOP_REG_STATUS, 0), sizeof(q));
+		ck(p.status == DP_SWOP_E_NOMAP, "seam restored: OP_READ reaches the real read again");
+	}
+
 	/* 9. NEGATIVE CONTROL — prove this harness can FAIL. Without it a green run
 	 *    says nothing: a test that cannot fail is a missing test that is trusted. */
 	{

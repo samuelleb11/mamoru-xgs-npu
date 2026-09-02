@@ -295,7 +295,13 @@ int dp_swop_service(const void *req_buf, unsigned req_len, void *resp_buf, unsig
 
 	switch (req.op) {
 	case DP_SWOP_OP_READ:
-		resp.status = reg_read(req.dev, req.reg, &resp.val);
+		/* REG_READ, not reg_read. This was the ONE call site in this file that bypassed
+		 * the test seam -- every other read and write goes through the macro -- and the
+		 * consequence was that OP_READ's SUCCESS path had no coverage at all: with the
+		 * window unmapped, every test of a legal address could only ever assert E_NOMAP.
+		 * That matters beyond tidiness, because A0.2's hardware negative control (read a
+		 * register, hand-write it from the NPU console, read again) is exactly this op. */
+		resp.status = REG_READ(req.dev, req.reg, &resp.val);
 		break;
 
 	case DP_SWOP_OP_WRITE:
