@@ -1137,8 +1137,20 @@ static void *mng_pump_thread(void *arg)
  * path. Mirrored here as literals rather than reaching into vendor internals; if a future
  * MUSDK renames them, dp_cap_find fails loudly and publishes nothing, which is the strict
  * direction — a carrier that wrongly says "not capable" costs telemetry an operator can
- * re-arm, while one that wrongly says "capable" costs a wedge that needs mains. */
+ * re-arm, while one that wrongly says "capable" costs a wedge that needs mains.
+ *
+ * THE CONSTANT IS NOT THE SYSFS NAME, and mirroring it was not enough. MUSDK passes "pci_ep"
+ * as the sys_iomem *devname* and the UIO layer publishes it as "uio_<devname>_<index>", so the
+ * name in /sys/class/uio/uioN/name is "uio_pci_ep_0" — measured on the appliance 2026-09-03,
+ * where the first publishing build logged "no uio 'pci_ep' region 'bar0'" and published nothing.
+ * The map name IS literally "bar0", so only the device name needed the convention applied.
+ *
+ * Both spellings are accepted: the bare constant in case a future MUSDK registers it directly,
+ * and the "uio_pci_ep" prefix that this platform actually produces. The discriminator that keeps
+ * this strict is not the device name anyway — it is the REQUIRED map named exactly "bar0",
+ * without which dp_cap_find refuses. */
 #define PCI_EP_UIO_MEM_NAME_STR	"pci_ep"
+#define PCI_EP_UIO_MEM_NAME_PFX	"uio_pci_ep"
 #define PCI_EP_UIO_BAR0_NAME_STR	"bar0"
 
 /* ---- D84 / #24-f: the swop capability carrier ---------------------------------------------
@@ -1187,7 +1199,9 @@ static int dp_cap_find(int *uio_no, int *map_no, unsigned long *map_len)
 		snprintf(path, sizeof(path), "/sys/class/uio/uio%d/name", u);
 		if (dp_cap_read_sysfs(path, val, sizeof(val)) != 0)
 			continue;
-		if (strcmp(val, PCI_EP_UIO_MEM_NAME_STR) != 0)
+		if (strcmp(val, PCI_EP_UIO_MEM_NAME_STR) != 0 &&
+		    strncmp(val, PCI_EP_UIO_MEM_NAME_PFX,
+			    sizeof(PCI_EP_UIO_MEM_NAME_PFX) - 1) != 0)
 			continue;
 		for (m = 0; m < 8; m++) {
 			snprintf(path, sizeof(path),
@@ -1232,8 +1246,9 @@ static int dp_cap_publish(void)
 	int uio_no, map_no;
 
 	if (dp_cap_find(&uio_no, &map_no, &len) != 0) {
-		pr_warn("dp_app: swop capability NOT published — no uio '%s' region '%s'\n",
-			PCI_EP_UIO_MEM_NAME_STR, PCI_EP_UIO_BAR0_NAME_STR);
+		pr_warn("dp_app: swop capability NOT published — no uio '%s'/'%s*' with region '%s'\n",
+			PCI_EP_UIO_MEM_NAME_STR, PCI_EP_UIO_MEM_NAME_PFX,
+			PCI_EP_UIO_BAR0_NAME_STR);
 		return -1;
 	}
 	/* Refuse rather than write past the end of a window smaller than the contract assumes. */
