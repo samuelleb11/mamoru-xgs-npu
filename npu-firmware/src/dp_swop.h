@@ -197,6 +197,39 @@ _Static_assert(offsetof(struct dp_swop_resp, ports) == 12, "resp.ports moved");
 
 /* Map the SMI window. Call ONCE at startup. Returns 0, or -errno.
  * Safe to call when already mapped (idempotent). */
+/* ---- D84 / #24-f: the SWOP CAPABILITY CARRIER --------------------------------------------
+ *
+ * The host must decide whether this NPU firmware speaks swop BEFORE it is allowed to send one,
+ * and every carrier tried before this named the wrong subject. The barmap version belongs to
+ * Marvell, so a vendor ABI bump would have opened our gate — which is why the host currently
+ * hardcodes the capability to false and telemetry is refused on a production boot.
+ *
+ * These words are published by OUR firmware into the NW_AGENT window of the host-visible BAR0
+ * and read passively by OUR driver. Neither half is vendor-owned, so a vendor change cannot
+ * forge them, and no message is sent to discover them — which matters because an unanswered
+ * custom send is the thing that strands the management channel (DEBT #80).
+ *
+ * WHY NW_AGENT. It is the facility the Sophos NetAgent used, and dp_fwd replaced NetAgent, so
+ * nothing should write it. The only reference to it anywhere in the MUSDK tree is our own
+ * portmap.h. "Should" is confirmed by reading the window on hardware before this publishes into
+ * it, not by this comment.
+ *
+ * THE VERSION IS MATCHED EXACTLY, NEVER `>=`. Firmware and driver ship independently — the NPU
+ * rootfs survives host OTAs — so a `>=` test would let a FUTURE firmware that changes the
+ * message shape open the gate for TODAY'S driver. Bump it on any shape change.
+ *
+ * ORDERING IS THE ATOMICITY. Publish writes the version first and the magic second, so a reader
+ * that sees the magic is guaranteed a version already sits beside it. Retract clears the magic
+ * first. There is no torn state in which the magic is present and the version is stale.
+ */
+#define DP_SWOP_CAP_WINDOW_OFF	0x4000u		/* NW_AGENT base within the host-visible BAR0 */
+/* Offset of the two-word slot inside that window. CONFIRM AGAINST A HARDWARE SURVEY before the
+ * first publishing build ships: the host's `npu_capability` attribute lists every non-zero word
+ * in the window, and this slot must land where nothing else writes. */
+#define DP_SWOP_CAP_SLOT_OFF	0x0000u
+#define DP_SWOP_CAP_MAGIC	0x53574f50u	/* "SWOP" */
+#define DP_SWOP_CAP_VERSION	1u
+
 int dp_swop_init(void);
 
 /* Release the mapping (test teardown; dp_fwd never needs it). */

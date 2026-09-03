@@ -101,6 +101,11 @@
 #include <sched.h>
 #include <fcntl.h>
 #include <sys/time.h>
+#include <sys/mman.h>	/* D84 #24-f: mmap the host-visible BAR0 capability window */
+#include <unistd.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <stdint.h>
 
 #include "mv_std.h"
 /* D84 switch-register handler. Included as a SINGLE TRANSLATION UNIT because the MUSDK
@@ -1128,6 +1133,147 @@ static void *mng_pump_thread(void *arg)
 	return NULL;
 }
 
+/* MUSDK names these in src/mng/pci_ep_def.h, which is internal and not on the app include
+ * path. Mirrored here as literals rather than reaching into vendor internals; if a future
+ * MUSDK renames them, dp_cap_find fails loudly and publishes nothing, which is the strict
+ * direction — a carrier that wrongly says "not capable" costs telemetry an operator can
+ * re-arm, while one that wrongly says "capable" costs a wedge that needs mains. */
+#define PCI_EP_UIO_MEM_NAME_STR	"pci_ep"
+#define PCI_EP_UIO_BAR0_NAME_STR	"bar0"
+
+/* ---- D84 / #24-f: the swop capability carrier ---------------------------------------------
+ *
+ * Publishes DP_SWOP_CAP_MAGIC + DP_SWOP_CAP_VERSION into the NW_AGENT window of the host-visible
+ * BAR0, so the host driver can decide whether this firmware speaks swop WITHOUT sending it a
+ * message to find out. See the contract note in dp_swop.h for why the vendor's barmap version
+ * could not carry this and why no probe may.
+ *
+ * PUBLISHED ON THE REGISTRATION SUCCESS PATH, NOT AT INIT. The predicate the host's gate needs is
+ * not "was this image built with swop source" — it is "is a handler registered right now". A word
+ * written at startup, or baked into .rodata, publishes even when the handler was compiled out,
+ * failed to register, or registered and was torn down. Writing it where registration succeeds is
+ * the only placement whose subject is the thing the gate cares about.
+ *
+ * The window is reached through the UIO device MUSDK maps as "pci_ep" region "bar0", discovered
+ * from sysfs because the uio index and map index are assigned at bind time. Mapping it here
+ * independently of MUSDK's own mapping keeps this out of nmp internals, which are not app-visible.
+ */
+static int dp_cap_fd = -1;
+static void *dp_cap_base;
+static size_t dp_cap_len;
+
+static int dp_cap_read_sysfs(const char *path, char *out, size_t cap)
+{
+	FILE *f = fopen(path, "r");
+	size_t n;
+
+	if (!f)
+		return -1;
+	n = fread(out, 1, cap - 1, f);
+	fclose(f);
+	out[n] = '\0';
+	while (n && (out[n - 1] == '\n' || out[n - 1] == ' '))
+		out[--n] = '\0';
+	return 0;
+}
+
+/* Locate uioN named "pci_ep" and the index of its map named "bar0". */
+static int dp_cap_find(int *uio_no, int *map_no, unsigned long *map_len)
+{
+	char path[256], val[64];
+	int u, m;
+
+	for (u = 0; u < 32; u++) {
+		snprintf(path, sizeof(path), "/sys/class/uio/uio%d/name", u);
+		if (dp_cap_read_sysfs(path, val, sizeof(val)) != 0)
+			continue;
+		if (strcmp(val, PCI_EP_UIO_MEM_NAME_STR) != 0)
+			continue;
+		for (m = 0; m < 8; m++) {
+			snprintf(path, sizeof(path),
+				 "/sys/class/uio/uio%d/maps/map%d/name", u, m);
+			if (dp_cap_read_sysfs(path, val, sizeof(val)) != 0)
+				continue;
+			if (strcmp(val, PCI_EP_UIO_BAR0_NAME_STR) != 0)
+				continue;
+			snprintf(path, sizeof(path),
+				 "/sys/class/uio/uio%d/maps/map%d/size", u, m);
+			if (dp_cap_read_sysfs(path, val, sizeof(val)) != 0)
+				return -1;
+			*map_len = strtoul(val, NULL, 0);
+			*uio_no = u;
+			*map_no = m;
+			return 0;
+		}
+	}
+	return -1;
+}
+
+static void dp_cap_retract(void)
+{
+	volatile uint32_t *slot;
+
+	if (!dp_cap_base)
+		return;
+	slot = (volatile uint32_t *)((char *)dp_cap_base +
+				     DP_SWOP_CAP_WINDOW_OFF + DP_SWOP_CAP_SLOT_OFF);
+	/* Magic first: a reader must never see a live magic beside a cleared version. */
+	slot[0] = 0;
+	__sync_synchronize();
+	slot[1] = 0;
+	__sync_synchronize();
+}
+
+static int dp_cap_publish(void)
+{
+	unsigned long len = 0;
+	volatile uint32_t *slot;
+	char dev[64];
+	int uio_no, map_no;
+
+	if (dp_cap_find(&uio_no, &map_no, &len) != 0) {
+		pr_warn("dp_app: swop capability NOT published — no uio '%s' region '%s'\n",
+			PCI_EP_UIO_MEM_NAME_STR, PCI_EP_UIO_BAR0_NAME_STR);
+		return -1;
+	}
+	/* Refuse rather than write past the end of a window smaller than the contract assumes. */
+	if (len < DP_SWOP_CAP_WINDOW_OFF + DP_SWOP_CAP_SLOT_OFF + 8) {
+		pr_warn("dp_app: swop capability NOT published — bar0 map is 0x%lx, too small for the slot\n",
+			len);
+		return -1;
+	}
+	snprintf(dev, sizeof(dev), "/dev/uio%d", uio_no);
+	dp_cap_fd = open(dev, O_RDWR | O_SYNC);
+	if (dp_cap_fd < 0) {
+		pr_warn("dp_app: swop capability NOT published — open %s: %s\n", dev, strerror(errno));
+		return -1;
+	}
+	/* UIO maps region N at file offset N * pagesize. */
+	dp_cap_base = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED,
+			   dp_cap_fd, (off_t)map_no * (off_t)getpagesize());
+	if (dp_cap_base == MAP_FAILED) {
+		pr_warn("dp_app: swop capability NOT published — mmap %s: %s\n", dev, strerror(errno));
+		dp_cap_base = NULL;
+		close(dp_cap_fd);
+		dp_cap_fd = -1;
+		return -1;
+	}
+	dp_cap_len = len;
+
+	slot = (volatile uint32_t *)((char *)dp_cap_base +
+				     DP_SWOP_CAP_WINDOW_OFF + DP_SWOP_CAP_SLOT_OFF);
+	/* Version first, magic second — the magic is the commit point, so a host that sees it is
+	 * guaranteed the version beside it is already the one that belongs to it. */
+	slot[1] = DP_SWOP_CAP_VERSION;
+	__sync_synchronize();
+	slot[0] = DP_SWOP_CAP_MAGIC;
+	__sync_synchronize();
+	pr_info("dp_app: swop capability published at bar0+0x%x (magic 0x%08x version %u) via %s map%d\n",
+		DP_SWOP_CAP_WINDOW_OFF + DP_SWOP_CAP_SLOT_OFF,
+		DP_SWOP_CAP_MAGIC, DP_SWOP_CAP_VERSION, dev, map_no);
+	return 0;
+}
+
 static int init_all_modules(void)
 {
 	struct pp2_init_params	 pp2_params;
@@ -1219,16 +1365,34 @@ static int init_all_modules(void)
 
 	nmp_guest_get_probe_str(garg.nmp_guest, &garg.prb_str);
 
-	nmp_guest_register_event_handler(garg.nmp_guest,
-					 NMP_GUEST_LF_T_NICPF,
-					 0,
-					 (NMP_GUEST_EV_NICPF_MTU | NMP_GUEST_EV_NICPF_MAC_ADDR),
-					 &garg,
-					 guest_ev_cb);
+	/* THE RETURN VALUE WAS BEING DISCARDED. nmp_guest_register_event_handler returns int and
+	 * refuses a second registration, so a failure here means no custom message is ever
+	 * delivered — the A0.1 echo and every swop op — while every other part of bring-up looks
+	 * healthy. That is the same silent shape as the starved pump above, and it was one line
+	 * away from it. Checked now, and nothing downstream is armed unless it succeeded. */
+	err = nmp_guest_register_event_handler(garg.nmp_guest,
+					       NMP_GUEST_LF_T_NICPF,
+					       0,
+					       (NMP_GUEST_EV_NICPF_MTU | NMP_GUEST_EV_NICPF_MAC_ADDR),
+					       &garg,
+					       guest_ev_cb);
+	if (err) {
+		pr_err("dp_app: guest event handler registration FAILED (%d) — no custom message can be delivered\n",
+		       err);
+		dp_cap_retract();
+		return err;
+	}
 
 	/* Only now may the pump touch the guest: it is initialised and its handler is armed.
 	 * Written last on purpose — the pump thread has been running since just after nmp_init. */
 	dp_guest_ready = 1;
+
+	/* D84 #24-f: publish the capability HERE, on the success path of the registration that
+	 * installs the handler — see dp_swop.h. Publishing earlier would advertise a handler that
+	 * may not exist; publishing on failure would advertise one that certainly does not. A
+	 * publish failure is logged and left unpublished: the host then reads no capability and
+	 * refuses telemetry, which is the safe direction. */
+	(void)dp_cap_publish();
 
 	return 0;
 }
