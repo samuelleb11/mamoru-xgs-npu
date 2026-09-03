@@ -994,8 +994,27 @@ static int ctrl_cb(void *arg)
 
 	/* MASTER management channel is pumped by the dedicated mng_pump_thread (started right
 	 * after nmp_init) — NOT here: ctrl_cb only runs after the full (slow) pp2/local init, far
-	 * too late for the host's post-HOST_MGMT_READY P3a/P3b handshake. See init_all_modules. */
-	nmp_guest_schedule(garg->nmp_guest);
+	 * too late for the host's post-HOST_MGMT_READY P3a/P3b handshake. See init_all_modules.
+	 *
+	 * D84: the GUEST channel is no longer pumped here either, for the SAME reason, and this
+	 * is the fix for a measured bench failure rather than a tidy-up. nmp_guest_schedule() is
+	 * the only thing that delivers a CUSTOM message to guest_ev_cb — the A0.1 echo and every
+	 * swop register op — and until 2026-09-03 this call was its ONLY caller. ctrl_cb is an
+	 * mvapp callback: init_app_params() memsets mvapp_params and never sets a ctrl_cb
+	 * threshold, and use_cli is 0 on a production boot, so how often it runs is mvapp's
+	 * business and not something this app states or controls.
+	 *
+	 * The consequence is not a slow custom channel, it is a DEAD one that reports healthy.
+	 * The PF channel has its own always-running pump, so CC_PF_* and the 1 Hz keep-alive
+	 * keep succeeding and the host's npu_mgmt keeps reading `ok` — while every CUSTOM send
+	 * times out at 5 s. Measured on the appliance 2026-09-03: PF handshake clean through
+	 * boot, then the first custom send (the A0.1 echo) and four swop reads all -110, with
+	 * npu_mgmt still `ok` at the time. Two channels, one health word, and the word belongs
+	 * to the half that was working.
+	 *
+	 * Pumping it from mng_pump_thread instead keeps ONE thread driving the guest, so this
+	 * is a move rather than an addition — calling it from both would race nmp_guest state.
+	 */
 
 	if (!garg->cmn_args.cli && garg->pkt_rate_stats)
 		maintain_stats(garg);
@@ -1073,6 +1092,11 @@ static int guest_ev_cb(void *arg, enum nmp_guest_lf_type client, u8 id, u8 code,
  * isolcpus 2/3 are unused by the single-core forwarder (runs on core 1). */
 #define DP_MNG_CORE 2
 static volatile int mng_pump_run = 1;
+/* Set once the guest is initialised AND its event handler is registered, so the pump never
+ * touches garg.nmp_guest before init_all_modules has finished building it. The pump thread
+ * starts right after nmp_init, which is well before guest init — the ordering that makes
+ * this flag load-bearing rather than defensive. */
+static volatile int dp_guest_ready;
 static void *mng_pump_thread(void *arg)
 {
 	struct glob_arg *g = (struct glob_arg *)arg;
@@ -1094,6 +1118,12 @@ static void *mng_pump_thread(void *arg)
 			nmp_schedule(g->nmp, NMP_SCHED_RX, NULL);
 			nmp_schedule(g->nmp, NMP_SCHED_TX, NULL);
 		}
+		/* D84: drive the GUEST channel from the same dedicated thread that drives the
+		 * master one. This is the custom path — the A0.1 echo and every swop register
+		 * op — and it used to be pumped only from ctrl_cb, where it starved. See the
+		 * note in ctrl_cb for the bench evidence. */
+		if (dp_guest_ready)
+			nmp_guest_schedule(g->nmp_guest);
 	}
 	return NULL;
 }
@@ -1195,6 +1225,10 @@ static int init_all_modules(void)
 					 (NMP_GUEST_EV_NICPF_MTU | NMP_GUEST_EV_NICPF_MAC_ADDR),
 					 &garg,
 					 guest_ev_cb);
+
+	/* Only now may the pump touch the guest: it is initialised and its handler is armed.
+	 * Written last on purpose — the pump thread has been running since just after nmp_init. */
+	dp_guest_ready = 1;
 
 	return 0;
 }
