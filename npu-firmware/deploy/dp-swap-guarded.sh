@@ -87,6 +87,25 @@ if [ ! -x "$CAND" ]; then
 	say "VERDICT=REFUSED reason=candidate-not-executable"
 	exit 1
 fi
+# The header above REQUIRES the candidate be named dp_fwd and explains why, but nothing
+# enforced it — the requirement lived only in a comment, which is the shape that reads as a
+# guard while being none. It is load-bearing: every stop here is by process NAME
+# (killall/pidof dp_fwd), so a candidate called dp_fwd.new is INVISIBLE to the rollback. The
+# script would fail to stop the failed candidate, start the incumbent anyway, and leave TWO
+# forwarders running — and a second dp_fwd crashes the NPU, whose only recovery is a mains
+# cycle. Refusing costs a re-invocation; the alternative costs physical access.
+if [ "$(basename "$CAND")" != "dp_fwd" ]; then
+	say "VERDICT=REFUSED reason=candidate-misnamed name=$(basename "$CAND")"
+	say "  the candidate must be named exactly 'dp_fwd', in its own directory:"
+	say "  every stop here is by process NAME, so any other name is invisible to the rollback"
+	exit 1
+fi
+# Same name in the same directory is not a candidate, it IS the incumbent — the swap would
+# be a no-op that reads as a successful test of new code.
+if [ "$(dirname "$CAND")" = "$DP" ]; then
+	say "VERDICT=REFUSED reason=candidate-is-the-incumbent-path dir=$DP"
+	exit 1
+fi
 if [ ! -x "$DP/dp_fwd" ]; then
 	say "VERDICT=REFUSED reason=no-incumbent-to-restore"
 	exit 1
