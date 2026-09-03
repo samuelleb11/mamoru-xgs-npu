@@ -53,6 +53,20 @@ wv() {
 # phyup PORT: C22 internal-PHY reg0 = 0x9140 (power up + reset), page 0
 phyup() { w 0x1c 0x19 0x0000; w 0x1c 0x18 $((0x9416 | ($1<<5))); w 0x1c 0x19 0x9140; w 0x1c 0x18 $((0x9400 | ($1<<5))); }
 
+# THESE TWO WRITES ARE ABSOLUTE, AND THAT IS LOAD-BEARING FAR OUTSIDE THIS SCRIPT.
+#
+# Setting reg 6 to a constant rather than read-modify-writing it is what makes a MAINS CYCLE a
+# complete and deterministic undo for ANY reg-6 value the box is left holding — including one put
+# there by D84's guarded VLAN-map write over the host mailbox. That is the abort path for the whole
+# write half of D84, and it is the ONLY one: the host-side never-widen guard refuses to restore a
+# narrowed map (restoring is itself a widening), so the mailbox cannot undo its own writes, and the
+# NPU console can only help while the management port's map is intact enough to reach the host.
+#
+# So a change here that looks locally reasonable — preserving existing bits, merging with what is
+# already there, "not clobbering the operator's map" — SILENTLY DELETES D84's abort path, and no
+# test anywhere goes red. If these writes ever need to stop being absolute, the write half of D84
+# needs a different abort first, and that is a decision for whoever owns it, not a side effect of
+# tidying this loop.
 echo "(1) per-port VLAN maps FIRST: front ports 1-10 -> CPU only (reg6=0x001); CPU -> all front (0x7fe)"
 ISO_FAIL=0
 for p in 1 2 3 4 5 6 7 8 9 10; do wv $p 6 0x001 || ISO_FAIL=$((ISO_FAIL + 1)); done
