@@ -67,10 +67,41 @@ phyup() { w 0x1c 0x19 0x0000; w 0x1c 0x18 $((0x9416 | ($1<<5))); w 0x1c 0x19 0x9
 # test anywhere goes red. If these writes ever need to stop being absolute, the write half of D84
 # needs a different abort first, and that is a decision for whoever owns it, not a side effect of
 # tidying this loop.
-echo "(1) per-port VLAN maps FIRST: front ports 1-10 -> CPU only (reg6=0x001); CPU -> all front (0x7fe)"
+# DEBT #151: THE CPU EGRESS MAP IS DERIVED, NOT TYPED, because three hand-written counts of the
+# same thing disagreed and the write-verify passed on the wrong one.
+#
+# The board has eleven switch ports. The descriptor assigns port 0 -> the CN9131 backplane (CPU)
+# and port 9 -> the SFP cage, and assigns port 10 NOTHING — there is no `port=1:10` anywhere in the
+# tree — while the AGNIC driver independently sets AGNIC_PPORT_COUNT = 9. So the CPU port's egress
+# map covers ports 1-9, which is 0x3fe. This line wrote 0x7fe, adding bit 10 — a real 10G-capable
+# SerDes lane with no assigned role — to the CPU's egress map at every boot, VERIFIED, and
+# dp-autostart.sh narrowed it a few lines later. It corrected; it did not corrupt. The defect was
+# upstream of the correction.
+#
+# WHY THIS IS SAFE WITHOUT ANSWERING "IS PORT 10 WIRED?", which is still unanswered and must not be
+# read as answered here: `npu_switch_ports` at diag=0 reads `sw=10 link=0` — DARK, WHICH IS NOT
+# PROOF; a lane can be cabled and dark. What licenses the change is a different, MEASURED fact:
+# `sw=0 vlanmap=0x03fe` on the running box. dp-autostart.sh's narrowing is unconditional, so
+# 0x3fe has been this appliance's steady state for its entire uptime. Narrowing here changes only
+# the TRANSIENT window between this line and that one; it cannot regress anything that is not
+# already excluded seconds later on every boot.
+#
+# TWO LISTS, DELIBERATELY. Port 10 keeps its own CPU-only isolation write — isolating a lane with
+# no role costs nothing and an UNWRITTEN map is the hazard (a powered front port with the part's
+# default map bridges the network to itself, 2026-08-08). What it does NOT get is a bit in the
+# CPU's egress map. Narrowing the isolation loop instead would have been the unsafe half of the
+# same edit.
+ISOLATE_PORTS="1 2 3 4 5 6 7 8 9 10"      # every front port: CPU-only, role or no role
+CPU_EGRESS_PORTS="1 2 3 4 5 6 7 8 9"      # ports with an assigned role (descriptor + PPORT_COUNT)
+CPU_MAP=0
+for p in $CPU_EGRESS_PORTS; do CPU_MAP=$((CPU_MAP | (1 << p))); done
+CPU_MAP_HEX=$(printf '0x%03x' "$CPU_MAP")
+
+echo "(1) per-port VLAN maps FIRST: front ports $ISOLATE_PORTS -> CPU only (reg6=0x001);"
+echo "    CPU -> ports $CPU_EGRESS_PORTS ($CPU_MAP_HEX)"
 ISO_FAIL=0
-for p in 1 2 3 4 5 6 7 8 9 10; do wv $p 6 0x001 || ISO_FAIL=$((ISO_FAIL + 1)); done
-wv 0 6 0x7fe || ISO_FAIL=$((ISO_FAIL + 1))
+for p in $ISOLATE_PORTS; do wv $p 6 0x001 || ISO_FAIL=$((ISO_FAIL + 1)); done
+wv 0 6 "$CPU_MAP" || ISO_FAIL=$((ISO_FAIL + 1))
 if [ "$ISO_FAIL" -eq 0 ]; then
 	echo "      isolation VERIFIED by read-back on all 11 ports"
 else
