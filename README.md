@@ -44,8 +44,9 @@ switch-init loops in this kit assume the 116's 8 front ports.**
 | `npu-firmware/switch-init/` | Native 88E6193X bring-up (replaces the proprietary init) | ours |
 | `npu-firmware/build/` | Cross-build pipeline (toolchain + MUSDK + dp_fwd) | ours |
 | `npu-firmware/deploy/` | Launcher + relay-to-NPU tooling | ours |
+| `npu-firmware/deploy/keys/` | Sophos's already-public NPU SSH key + why it's here | **not ours** |
 | `tools/probe.sh` | The hardware check above | ours |
-| `docs/` | Build, hardware, licensing, provenance, architecture | — |
+| `docs/` | Build, hardware, NPU install, licensing, provenance, architecture | — |
 
 ## Which OS?
 
@@ -59,13 +60,28 @@ switch-init loops in this kit assume the 116's 8 front ports.**
 
 Either way the **NPU firmware is the same** — `dp_fwd` is host-OS-agnostic.
 
+## Getting onto the NPU
+
+Most of this kit assumes you can already reach the CN9130. If you cannot, start with
+**`docs/NPU-INSTALL.md`**: there is a PCIe management link inside the chassis, it comes up
+against factory firmware, and the factory firmware answers SSH on it. That doc brings the link
+up, finds the NPU, gets you a root shell, and — with an honest account of what is measured and
+what is not — replaces the NPU's root filesystem without stranding the box. **No TFTP is
+involved anywhere**; the NPU's bootloader has no network at all, which that doc also explains
+so you do not go looking.
+
 ## Licensing in one line
 
 Everything we wrote is permissive (MIT/BSD) or GPL-dual. `dp_fwd` is Marvell
 **GPLv2** (shipped with source). The pieces that are *not* ours to give you — the
 NPU's base OS, the `mv_armada_ep` endpoint driver, the Marvell UIO modules — you
-already own on your XGS and extract from your own box. Nothing proprietary is
-redistributed here. Full detail: `docs/LICENSING.md`, `docs/VENDOR-BITS.md`, and `docs/PROVENANCE.md`.
+already own on your XGS and extract from your own box. **One deliberate exception**
+travels with the kit: `npu-firmware/deploy/keys/mvmgt.x86`, Sophos's NPU management
+SSH key. It is not ours; it is bundled because it is already public in Sophos's own
+downloadable firmware ISO and already trusted by every XGS's NPU, so it confers
+nothing on anyone — and without it the install path stops being repeatable. The
+README beside it says all of that at length. Full detail: `docs/LICENSING.md`,
+`docs/VENDOR-BITS.md`, and `docs/PROVENANCE.md`.
 
 ## Status (be honest with yourself before you start)
 

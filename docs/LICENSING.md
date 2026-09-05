@@ -59,8 +59,24 @@ already has it. See `VENDOR-BITS.md` for how you use your own box's copies.
 your specific appliance; passing them to someone else is not yours to do. The
 whole design of this kit is to avoid ever needing to.
 
+### The one deliberate exception: `npu-firmware/deploy/keys/mvmgt.x86`
+
+One vendor artifact *is* in this repository, knowingly: the RSA key the x86 host
+uses to SSH into the NPU. It is Sophos's, not ours. It is bundled because it is
+**already public** — it ships unencrypted in Sophos's downloadable firmware ISO,
+and its public half is already in `/root/.ssh/authorized_keys` on every XGS's NPU
+— so publishing it hands nobody anything they did not already have, while leaving
+it out would turn a repeatable install into an archaeology exercise. It
+authenticates to a coprocessor inside a chassis you must already own root on.
+
+`npu-firmware/deploy/keys/README.md` carries the full justification and two ways
+to verify our copy against your own box. **Read it as a single settled exception,
+not as a precedent** — nothing else vendor-side ships here, and the rest of Tier 3
+stays exactly as above.
+
 ## So, can I pass this kit to a friend?
 
 Yes — Tiers 1 and 2 together, with this file and the corresponding source for
-`dp_fwd`. Your friend supplies the Tier-3 pieces from **his own** appliance. No
-proprietary material changes hands.
+`dp_fwd`. Your friend supplies the Tier-3 pieces from **his own** appliance. The
+only vendor artifact travelling with the kit is the already-public NPU SSH key
+noted above, and it confers nothing his own appliance did not already trust.

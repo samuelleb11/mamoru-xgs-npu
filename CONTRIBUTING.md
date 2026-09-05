@@ -19,6 +19,9 @@ See `docs/BUILD.md`. In short:
 
 Test on real hardware where you can, and say what you tested (board model, kernel, OS).
 
+For NPU firmware work you need a shell on the NPU itself: `docs/NPU-INSTALL.md` is the
+management-link + SSH route, and the honest list of what in it is measured and what is not.
+
 ## Licensing & sign-off
 - Every source file carries an `SPDX-License-Identifier` — keep it. New first-party
   files are `MIT` unless there's a specific reason otherwise. Full map: `docs/LICENSING.md`.
@@ -26,7 +29,9 @@ Test on real hardware where you can, and say what you tested (board model, kerne
   not use it as clean-room input (see that directory's README).
 - Do **not** add vendor/proprietary material or PII — IPs, keys, device link-locals,
   hostnames, home paths. `docs/VENDOR-BITS.md` and `docs/PROVENANCE.md` explain what
-  stays on your own box and how to obtain it there.
+  stays on your own box and how to obtain it there. The single settled exception is
+  `npu-firmware/deploy/keys/mvmgt.x86` (see the README beside it and `docs/LICENSING.md`);
+  it is not a precedent for adding others.
 - Sign off your commits (Developer Certificate of Origin): `git commit -s`.
 
 ## Good first contributions

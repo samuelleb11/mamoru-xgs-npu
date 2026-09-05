@@ -3,10 +3,13 @@
 # Runs ON the host: relay dp_fwd + nmp config to the NPU's writable partition over mvmgmt0.
 # Push the two files to the host /tmp first, then run this.
 #
-# >>> Set NPU (your NPU's link-local on mvmgmt0) and KEY (an ssh key the NPU trusts for root).
-#     The link-local differs per box: discover it with `ping6 -c2 ff02::1%mvmgmt0` on the host.
+# >>> Set NPU (your NPU's link-local on mvmgmt0). Discover it, don't guess: bring mvmgmt0 up
+#     (`ip link set mvmgmt0 up` -- it is created DOWN), then `ping6 -c2 ff02::1%mvmgmt0` and read
+#     `ip -6 neigh show dev mvmgmt0`. Full procedure + the whole install: docs/NPU-INSTALL.md.
+#     KEY defaults to the bundled key the factory NPU already trusts (keys/README.md explains
+#     what it is and why it is in this repo); set NPU_KEY to use your own once you've added it.
 #     DST is where dp_fwd lives on the NPU; it must match dp-autostart.sh's DP dir.
-KEY=${NPU_KEY:-$HOME/.ssh/npu_mgmt_key}
+KEY=${NPU_KEY:-"$(dirname "$0")/keys/mvmgt.x86"}
 NPU=${NPU_LL:-'fe80::YOUR-NPU-EUI64%mvmgmt0'}
 DST=${NPU_DST:-/opt/dp}
 ifconfig mvmgmt0 inet6 -ifdisabled auto_linklocal up >/dev/null 2>&1

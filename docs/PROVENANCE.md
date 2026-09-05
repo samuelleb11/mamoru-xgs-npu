@@ -50,18 +50,24 @@ echo 'uname -sr' | sh host-driver-linux/tools/npc.sh
 find / -name 'musdk_cma.ko' -o -name 'mv_dmax2_uio.ko' 2>/dev/null   # typically /lib/modules/4.14.*/extra/
 ```
 
-**3. Bulk transfer** (the `dp_fwd` binary, module blobs) over `ttyS2` with base64, or over a plain
-data pipe. `npu-firmware/deploy/relay-deploy.sh` is a reference for the network path once it's safe.
+**3. Bulk transfer** (the `dp_fwd` binary, module blobs) over `ttyS2` with base64 — or, far more
+comfortably, over the `mvmgmt0` network link with `scp`. `docs/NPU-INSTALL.md` is the full network
+path (bring the link up, find the NPU, SSH in); `npu-firmware/deploy/relay-deploy.sh` wraps it for
+pushing `dp_fwd` and its config.
 
 The NPU base OS and `mv_armada_ep` you do **not** extract — they stay resident and boot the NPU; the
 host driver just reads the barmap they publish.
 
 ## Safety warnings (learned the hard way)
 
-- **Do NOT `ifconfig mvmgmt0 up` on the NPU with stock firmware.** The stock p3 boot keeps it down on
-  purpose (a TX-open crash); bringing it up wedges the NPU console in uninterruptible D-state, and the
-  only recovery is a full appliance **power-cycle** (~6-min NPU cold boot). Use `ttyS2` for control and
-  bulk transfer instead.
+- **`mvmgmt0` up on the NPU: normal on VENDOR firmware, a box-wedger on a minimal rootfs of your own.**
+  Measured 2026-09-04 on a factory XGS 116: the vendor rootfs brings `mvmgmt0` up itself at boot, from a
+  static stanza in its own `/etc/network/interfaces`, and it is the transport Sophos uses — SSH into a
+  factory NPU over it is proven (`NPU-INSTALL.md`). **The hazard is a rootfs you build.** An early
+  minimal NPU rootfs of ours carried a pcinet build that crashes on open: `ifconfig mvmgmt0 up` on that
+  wedged the NPU console in uninterruptible D-state, and the only recovery was a full appliance
+  **power-cycle** (~6-min NPU cold boot). An earlier revision of this file attributed that wedge to
+  stock firmware; that was wrong — it was ours. Keep `ttyS2` available as the fallback either way.
 - **Never trigger a PF FLR** on the host side — it nukes the NPU firmware state.
 - The GIU host↔NPU handshake latches host ring addresses once per NPU boot; sequence a host reboot and
   an NPU reboot with care, or you'll desync the trunk and need to restart both ends.

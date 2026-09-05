@@ -75,9 +75,14 @@ sh build_swcfg.sh                                                          # -> 
 
 Deploy onto the NPU (into `/opt/dp/`): `dp_fwd`, `dp-nmp-config.txt`, the
 `switch-init/` scripts, and your box's Marvell UIO modules (see `VENDOR-BITS.md`).
-`npu-firmware/deploy/relay-deploy.sh` does this over serial→host→`mvmgmt0`. At NPU
+`npu-firmware/deploy/relay-deploy.sh` does this over `mvmgmt0` with `scp`. At NPU
 boot, `dp-autostart.sh` loads the UIO modules, runs `sw-init.sh`, and execs
 `dp_fwd`.
+
+**If you have never reached your NPU before, do `NPU-INSTALL.md` first** — it brings the
+`mvmgmt0` management link up, finds the NPU's address and gets you a root shell over SSH.
+It also covers replacing the NPU's whole root filesystem, which is the heavier job this
+`/opt/dp/` drop-in avoids.
 
 ---
 

@@ -28,10 +28,11 @@ clean-room `switch-init/` replaces them.
 ## How to get them
 
 1. Get a shell on the NPU. Two ways:
-   - **Serial:** the NPU has a console on the host's `ttyS2` (used by
-     `npu-firmware/deploy/relay-deploy.sh`).
-   - **Network:** once the base OS is up, the NPU is reachable over the internal
-     `mvmgmt0` link from the host.
+   - **Network (easier):** the NPU is reachable over the internal `mvmgmt0` PCIe
+     link from the host, and its factory firmware runs `sshd`. Full procedure in
+     `NPU-INSTALL.md`; `npu-firmware/deploy/relay-deploy.sh` wraps it.
+   - **Serial:** the NPU has a console on the host's `ttyS2`. Slower, but it needs
+     nothing to be working first — keep it as the fallback.
 2. Find the UIO modules: `find / -name 'musdk_cma.ko' -o -name 'mv_dmax2_uio.ko'`.
 3. Copy them alongside the kit's deploy payload (into `/opt/dp/` on the NPU), so
    `dp-autostart.sh` can `insmod` them.
@@ -41,6 +42,12 @@ clean-room `switch-init/` replaces them.
 Do not pass any of these Tier-3 files to anyone else. They came with *your*
 appliance and stay with it. If a second person wants to run this kit, they pull
 the equivalent files from *their* own box.
+
+**One vendor file is an exception and it is already in this repo:** Sophos's NPU
+SSH key, `npu-firmware/deploy/keys/mvmgt.x86`. It is public in Sophos's own
+downloadable ISO and already trusted by every XGS's NPU, so bundling it gives
+nobody anything — see `LICENSING.md` and the README beside the key. It is the only
+one; everything in the table above still comes off your own box.
 
 ---
 
