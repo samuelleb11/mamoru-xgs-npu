@@ -1,82 +1,110 @@
 # Licensing map
 
-This kit is a **mixed-license** package. That is normal and fine, but it means
-"can I give this to someone / publish it?" has three different answers depending
-on the piece. This file is the map. If you redistribute the kit onward, keep this
-file with it.
+mamoru-xgs-npu is a mixed-licence package: the answer to "can I redistribute this?" differs per
+component. If you redistribute the kit onward, this file travels with it.
 
-## Tier 1 — ours, permissive (redistribute freely)
+| Tier | Contents | Redistribution |
+|---|---|---|
+| 1 | First-party code | Freely, under the permissive terms named below |
+| 2 | Marvell code under the GPL | Only under the GPL, with corresponding source |
+| 3 | Vendor components | Not ours, not shipped here, not needed from us |
 
-| Piece | License |
+Full licence texts are in [`LICENSES/`](../LICENSES/). The root [`LICENSE`](../LICENSE) carries the
+same component table in short form.
+
+## Tier 1 — first-party code
+
+| Component | SPDX |
 |---|---|
 | `host-driver-linux/` (all `agnic_*.c/.h`, Makefile) | **GPL-2.0 OR MIT** (dual) |
 | `host-driver-freebsd/` (all `if_agnic*`, `agnic_*`) | **BSD-2-Clause** |
-| `npu-firmware/src/` (wire-contract headers + `dp_app` skeleton) | MIT |
-| `npu-firmware/switch-init/` (`sw-init.sh`, `swmdio.sh`, `sfp-init.sh`, `dp_swcfg.c`) | ours |
-| `npu-firmware/build/`, `npu-firmware/deploy/`, `tools/` | ours |
+| `npu-firmware/src/` (wire-contract headers, `dp_app` skeleton, switch-op handler) | **MIT** |
+| `npu-firmware/switch-init/` shell bring-up (`sw-init.sh`, `swmdio.sh`, `sfp-init.sh`) | **MIT** |
+| `npu-firmware/switch-init/dp_swcfg.c` | **MIT** |
+| `npu-firmware/build/`, `npu-firmware/deploy/` (less `keys/mvmgt.x86`), `tools/` | **MIT** |
 
-These are **clean-room**: written against documented hardware behaviour and
-observed traffic. The host drivers transcribe only *interface facts* (register
-offsets, the AGNIC ABI) — no third-party `.c` logic. The native switch-init
-reverse-engineers the register sequence the proprietary Sophos init performed, so
-it needs **no** `libsbsp` and **no** `xgs-mvl6193-init`.
+Each of these files carries its own `SPDX-License-Identifier`, except
+`npu-firmware/deploy/dp-nmp-config.txt`; it and the docs are MIT under the root `LICENSE`.
+`npu-firmware/deploy/keys/mvmgt.x86` is Sophos's, and is covered in Tier 3 below.
 
-## Tier 2 — GPLv2 (redistributable, but only under the GPL, with source)
+Tier 1 is clean-room: written against documented hardware behaviour and observed traffic. The host
+drivers transcribe only *interface facts*, meaning register offsets and the AGNIC ABI, and contain no
+third-party `.c` logic. The shell bring-up in `npu-firmware/switch-init/` reverse-engineers the
+register sequence the proprietary Sophos init performed and drives the switch over raw SMI, so the
+kit needs no `libsbsp` and no `xgs-mvl6193-init`. That bring-up is the shipping path:
+`npu-firmware/deploy/dp-autostart.sh` runs `sw-init.sh`, then execs `dp_fwd`. `dp_swcfg` is on no
+runtime path.
 
-| Piece | Origin / terms |
+`dp_swcfg.c` is the one Tier 1 file that does not stand alone. It is ours and it is MIT, but it
+`#include`s `msdApi.h` and links `libMsdDrv.a` and `libMRegAccess_mvmdio_uio.a`, which
+`npu-firmware/build/build_swcfg.sh` builds from a Marvell UMSD (Unified Switch Driver) tree it
+expects at `$W/umsd`. No UMSD tree is in this repository and no script here fetches one, so
+`build_swcfg.sh` run as documented stops at `cd "$UMSD"`: `dp_swcfg` is not buildable from this kit
+as it stands. At runtime it opens `/dev/mvmdio-uio`, which the shell bring-up deliberately does not
+use.
+
+## Tier 2 — Marvell code under the GPL
+
+| Component | Origin and terms |
 |---|---|
-| `npu-firmware/forwarder/forwarder.c` → compiled into `dp_fwd` | Marvell, multi-option; we elect **GPLv2** |
-| Marvell **MUSDK** (linked into `dp_fwd`) | GPL-2.0 — **not shipped here**, fetched at build time (see below) |
+| `npu-firmware/forwarder/forwarder.c`, compiled into `dp_fwd` | Marvell, multi-option licence; we elect **GPLv2** |
+| Marvell MUSDK, linked into `dp_fwd` | **GPL-2.0**; not shipped here, fetched at build time |
 
 Rules for `forwarder.c`:
-- **Do not relicense it and do not strip its header.** Marvell's terms require the
-  copyright notice be preserved on whichever license option is elected.
-- It is **quarantined** in its own directory precisely so its license can't be
-  lost by proximity to our code. It is **not** clean-room input — do not read it
-  and then write host-driver code.
-- Because it is compiled into a binary you may ship (`dp_fwd`), it is committed
-  here as source. If you distribute `dp_fwd`, you must also make this
-  corresponding source available (that's just GPLv2).
 
-**MUSDK is not in this repo.** `npu-firmware/build/env.sh` pins it to Marvell's
-public `MarvellEmbeddedProcessors/musdk-marvell` (SDK-10.3.5.0 tag). You fetch it
-at build time like any dependency. It is GPL-2.0 and public; we neither ship nor
-need to ship it.
+- Do not relicense it and do not strip its header. Marvell's terms require the copyright notice be
+  preserved on whichever licence option is elected. The file carries no `SPDX-License-Identifier`
+  line; that header is its licence statement.
+- It is quarantined in its own directory precisely so its licence cannot be lost by proximity to our
+  code. The directory's rules are in
+  [`npu-firmware/forwarder/README.md`](../npu-firmware/forwarder/README.md).
+- It is not clean-room input. Do not read it and then write host-driver code.
+- Because it is compiled into a binary you may ship (`dp_fwd`), it is committed here as source.
+  Distributing `dp_fwd` obliges you to make the corresponding source available (GPL-2.0 §3).
 
-## Tier 3 — vendor, NOT ours, NOT shipped, NOT needed from us
+`npu-firmware/src/dp_swop.c` is MIT and is `#include`d at `forwarder.c:116`: the MUSDK app makefile
+builds exactly one `.c` for the example `dp_fwd` is forked from, so the two files compile as a
+single translation unit. That unit is not the whole binary. `dp_fwd` is built inside the MUSDK tree
+and links MUSDK's app-common objects (`mvapp`, `cli`, `pp2_utils`, `giu_utils`, `nmp_guest_utils`)
+and the MUSDK library with it.
 
-None of the following is in this kit, and none of it needs to be — your XGS
-already has it. See `VENDOR-BITS.md` for how you use your own box's copies.
+MUSDK is not in this repository. `npu-firmware/build/env.sh` names Marvell's public
+`MarvellEmbeddedProcessors/musdk-marvell` at tag `SDK-10.3.5.0-PR2`, in a comment on the `MUSDK`
+path variable. The build compiles whatever tree is mounted at that path, so the tag records the
+intended checkout rather than enforcing one. MUSDK is GPL-2.0 and public; this project neither ships
+it nor needs to. The fetch and build steps are in [`BUILD.md`](BUILD.md).
 
-- The Sophos BSP (`libsbsp.so`, `xgs-mvl6193-init`, `xgs-platform*`, the
-  `opt/sophos/plt/*` platform DB) — Sophos/Marvell proprietary.
-- Sophos NetAgent / the stock data-plane binary.
-- The NPU's base OS + bootloader (on the NPU's own eMMC).
-- `mv_armada_ep` (the PCIe-endpoint driver that publishes the barmap) — blob-locked.
-- The Marvell UIO modules `musdk_cma.ko`, `mv_dmax2_uio.ko`.
+## Tier 3 — vendor components, not distributed
 
-**Do not redistribute any Tier-3 item.** They are licensed to you as the owner of
-your specific appliance; passing them to someone else is not yours to do. The
-whole design of this kit is to avoid ever needing to.
+None of the following is in this kit, and none of it needs to be: your XGS already has it.
+[`VENDOR-BITS.md`](VENDOR-BITS.md) covers using your own box's copies.
 
-### The one deliberate exception: `npu-firmware/deploy/keys/mvmgt.x86`
+- The Sophos BSP: `libsbsp.so`, `xgs-mvl6193-init`, `xgs-platform*`, and the `opt/sophos/plt/*`
+  platform DB. Sophos/Marvell proprietary.
+- Sophos NetAgent and the stock data-plane binary.
+- The NPU's base OS and bootloader, on the NPU's own eMMC.
+- `mv_armada_ep`, the PCIe-endpoint driver that publishes the barmap. Blob-locked.
+- The Marvell UIO modules `musdk_cma.ko` and `mv_dmax2_uio.ko`.
 
-One vendor artifact *is* in this repository, knowingly: the RSA key the x86 host
-uses to SSH into the NPU. It is Sophos's, not ours. It is bundled because it is
-**already public** — it ships unencrypted in Sophos's downloadable firmware ISO,
-and its public half is already in `/root/.ssh/authorized_keys` on every XGS's NPU
-— so publishing it hands nobody anything they did not already have, while leaving
-it out would turn a repeatable install into an archaeology exercise. It
-authenticates to a coprocessor inside a chassis you must already own root on.
+Do not redistribute any Tier-3 item. They are licensed to you as the owner of your specific
+appliance, and passing them on is not yours to do.
 
-`npu-firmware/deploy/keys/README.md` carries the full justification and two ways
-to verify our copy against your own box. **Read it as a single settled exception,
-not as a precedent** — nothing else vendor-side ships here, and the rest of Tier 3
-stays exactly as above.
+### Bundled exception: `npu-firmware/deploy/keys/mvmgt.x86`
 
-## So, can I pass this kit to a friend?
+One vendor artefact is in this repository, knowingly: the RSA key the x86 host uses to SSH into the
+NPU. It is Sophos's, not ours. It is bundled because it is already public — it ships unencrypted in
+Sophos's downloadable firmware ISO, its public half is already in `/root/.ssh/authorized_keys` on
+every XGS's NPU, publishing it therefore hands nobody anything they did not already have, and
+omitting it would turn a repeatable install into an archaeology exercise. It authenticates to a
+coprocessor inside a chassis you must already own root on.
 
-Yes — Tiers 1 and 2 together, with this file and the corresponding source for
-`dp_fwd`. Your friend supplies the Tier-3 pieces from **his own** appliance. The
-only vendor artifact travelling with the kit is the already-public NPU SSH key
-noted above, and it confers nothing his own appliance did not already trust.
+[`npu-firmware/deploy/keys/README.md`](../npu-firmware/deploy/keys/README.md) carries the full
+justification and two independent checks of this copy against your own box, one of them recorded
+there as measured. This file defers to that record rather than making the claim independently.
+
+No other vendor artefact ships in this repository, and the rest of Tier 3 stands as listed above.
+
+## Redistribution
+
+Tiers 1 and 2 may be redistributed together, accompanied by this file and by the corresponding
+source for `dp_fwd`. The recipient supplies the Tier-3 components from their own appliance.

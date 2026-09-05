@@ -198,6 +198,15 @@ static inline void agnic_rd_mac(struct agnic *ag, int bar, u32 off, u8 mac[ETH_A
 
 const char *agnic_facility_name(enum agnic_facility f);
 
+/* P4: the base address the front-panel port MACs are derived from (agnic_main.c).
+ * Fills base[0..4]; the caller sets base[5] to the port number.
+ *
+ * If NW_AGENT is ever wired up on Linux, its per-port mac_set MUST be fed from this
+ * function. The FreeBSD tree recomputes the address independently (agnic_nwa.c), which
+ * was safe only while both sides hardcoded the same constant; registering an address the
+ * host does not source tells the switch to accept a source MAC that never arrives. */
+void agnic_port_mac_base(struct agnic *ag, u8 base[ETH_ALEN]);
+
 /* P3: GIU management channel (agnic_mgmt.c). Split so the persistent half (publish
  * rings + HOST_MGMT_READY) runs once at probe, and the handshake half is retriable:
  * agnic_mgmt_finish() returns -EAGAIN until the NPU answers DEV_MGMT_READY. */

@@ -220,12 +220,20 @@ drop:
 
 int agnic_pport_bringup(struct agnic *ag)
 {
+	u8 base[ETH_ALEN];
 	int i, ret;
 
+	/* Per-unit base, so two appliances on one L2 segment do not collide. Falls back
+	 * to the historical fixed 02:81:00:00:00:00 when no per-unit source is readable. */
+	agnic_port_mac_base(ag, base);
+
 	for (i = 0; i < AGNIC_PPORT_COUNT; i++) {
-		u8 mac[ETH_ALEN] = { 0x02, 0x81, 0x00, 0x00, 0x00, (u8)(i + 1) };
+		u8 mac[ETH_ALEN];
 		struct net_device *ndev;
 		struct agnic_port *p;
+
+		memcpy(mac, base, ETH_ALEN);	/* not ether_addr_copy: no u16 alignment here */
+		mac[5] = (u8)(i + 1);		/* distinct per port: 1..9 */
 
 		ndev = alloc_etherdev(sizeof(struct agnic_port));
 		if (!ndev) {

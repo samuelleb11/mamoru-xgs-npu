@@ -36,6 +36,23 @@ else
 fi
 
 echo
+echo "== board identity (seeds the front-panel port MACs) =="
+echo "The Linux driver derives per-appliance port MACs from the first usable of these"
+echo "(see host-driver-linux/README.md). A placeholder value on all three means every"
+echo "appliance falls back to the shared 02:81:00:00:00:0N."
+for f in product_uuid product_serial board_serial; do
+    p="/sys/class/dmi/id/$f"
+    if [ -r "$p" ]; then
+        v=$(cat "$p" 2>/dev/null)
+        echo "  $f: ${v:-(empty)}"
+    elif [ -e "$p" ]; then
+        echo "  $f: (unreadable — product_uuid and the serials need root)"
+    else
+        echo "  $f: (absent — no DMI on this host)"
+    fi
+done
+
+echo
 echo "== interpretation =="
 echo " - id 11ab:7080 present + BARs 1M/16M/16M  -> host driver is a near-drop-in; proceed to docs/BUILD.md"
 echo " - id present, BARs differ                 -> characterize the 136 endpoint before building"

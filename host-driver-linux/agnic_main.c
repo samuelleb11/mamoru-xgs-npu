@@ -21,6 +21,8 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/etherdevice.h>
+#include <linux/crc32.h>
+#include <linux/dmi.h>
 #include "agnic.h"
 
 /* Bring up the mvmgmt0 host<->NPU management netdev after attach. OFF by default:
@@ -45,6 +47,11 @@ MODULE_PARM_DESC(p3, "bring up the P3 GIU management channel (default on)");
 static bool dp = true;
 module_param(dp, bool, 0444);
 MODULE_PARM_DESC(dp, "bring up the P3b/P4 GIU datapath after the mgmt channel (default on)");
+
+/* Which per-unit source seeds the front-panel port MACs. See agnic_port_mac_base(). */
+static int mac_src;
+module_param(mac_src, int, 0444);
+MODULE_PARM_DESC(mac_src, "port MAC source: 0=DMI then NPU device MAC, 1=NPU device MAC first, 2=fixed 02:81:00:00:00:0N (default 0)");
 
 const char *agnic_facility_name(enum agnic_facility f)
 {
@@ -167,6 +174,165 @@ static int agnic_read_barmap(struct agnic *ag)
 	}
 
 	return 0;
+}
+
+/*
+ * Re-sample the NPU-published device MAC in GIU config_mem.
+ *
+ * agnic_read_barmap() reads it once, in probe. Probe runs at device_initcall, seconds
+ * into boot, and normally beats the NPU's ~60s boot — so DEV_READY is clear there and
+ * ag->mac reads back all-zero from the devm_kzalloc'd struct. By P4 the mgmt handshake
+ * has completed, which means the NPU is up, so this is the first point at which the
+ * field is worth reading.
+ */
+static void agnic_refresh_dev_mac(struct agnic *ag)
+{
+	int gbar = ag->fac_bar[AGNIC_FAC_GIU];
+	u32 goff, status;
+
+	if (gbar < 0)
+		return;
+	goff = ag->fac_off[AGNIC_FAC_GIU];
+	status = agnic_rd(ag, gbar, goff + AGNIC_GIU_STATUS_OFF);
+	ag->dev_ready = !!(status & AGNIC_CFG_STATUS_DEV_READY);
+	if (ag->dev_ready)
+		agnic_rd_mac(ag, gbar, goff + AGNIC_GIU_MAC_OFF, ag->mac);
+}
+
+/* Factory placeholders. A board that reports one of these reports it on every unit, so
+ * accepting one would hand the whole installed base the same address while looking like
+ * a success. Matched case-insensitively and by prefix, because vendors vary the case and
+ * append junk ("Default String", "System Serial Number  "). */
+static const char * const agnic_dmi_junk[] = {
+	"none", "default string", "not specified", "system serial number",
+	"to be filled", "o.e.m.", "0123456789", "unknown", "n/a",
+	"00000000-0000-0000-0000-000000000000",
+	"ffffffff-ffff-ffff-ffff-ffffffffffff",
+};
+
+static bool agnic_dmi_usable(const char *s)
+{
+	size_t i;
+
+	if (!s)
+		return false;
+	while (*s == ' ')
+		s++;
+	if (strlen(s) < 4)
+		return false;
+	for (i = 0; i < ARRAY_SIZE(agnic_dmi_junk); i++)
+		if (!strncasecmp(s, agnic_dmi_junk[i], strlen(agnic_dmi_junk[i])))
+			return false;
+	return true;
+}
+
+/*
+ * 24 bits of per-unit entropy from the x86 board's own DMI, which needs nothing from the
+ * NPU.
+ *
+ * UUID first: SMBIOS requires it to be unique per unit, and it is the field appliance
+ * vendors are least likely to stub. The serials are tried after it, not before, so that
+ * a board with a placeholder serial does not shadow a good UUID — the loop takes the
+ * first USABLE field, and ordering decides which that is.
+ */
+static bool agnic_dmi_entropy(u32 *out)
+{
+	static const int ids[] = { DMI_PRODUCT_UUID, DMI_PRODUCT_SERIAL, DMI_BOARD_SERIAL };
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(ids); i++) {
+		const char *s = dmi_get_system_info(ids[i]);
+
+		if (!agnic_dmi_usable(s))
+			continue;
+		*out = crc32_le(~0U, (const u8 *)s, strlen(s)) & 0xffffff;
+		return true;
+	}
+	return false;
+}
+
+/*
+ * Base address for the front-panel port MACs: 02:81:<24 bits per unit>:<port>.
+ *
+ * Locally administered throughout. This project owns no OUI, so a globally-unique
+ * address would be a claim it cannot make — including when the source is a real
+ * hardware address, of which the NPU publishes exactly one for the whole trunk while
+ * nine distinct port addresses are needed.
+ *
+ * Two candidate sources, and mac_src picks the order:
+ *   - the x86 board's DMI serial or UUID, hashed. Per-unit by SMBIOS convention, and
+ *     readable without the NPU;
+ *   - the NPU-published device MAC (GIU config_mem + AGNIC_GIU_MAC_OFF), low three
+ *     octets, so the derived address stays legibly related to the hardware one.
+ * If neither yields anything the base is all-zero, which reproduces the historical
+ * fixed 02:81:00:00:00:0N byte for byte. That floor means this can never fail.
+ *
+ * DMI is preferred by default because the device MAC's provenance is not yet
+ * established: nothing in npu-firmware/ writes that field, and its sibling in the
+ * pcinet descriptor (PC_CFG_REMOTE_MAC, the NPU's own address) is a firmware constant
+ * that reads identically on every unit. A source that is constant across appliances is
+ * worse than no source at all here, because it looks like identity and is not. Once
+ * `P4: port MAC base ... (NPU device MAC)` has been compared across two units and the
+ * values differ, `mac_src=1` makes it the preferred source.
+ */
+void agnic_port_mac_base(struct agnic *ag, u8 base[ETH_ALEN])
+{
+	u32 dev_ent = 0, dmi_ent = 0, ent;
+	bool dev_ok, dmi_ok;
+	const char *src;
+	int mode = mac_src;
+
+	if (mode < 0 || mode > 2) {
+		dev_warn(ag->dev, "P4: mac_src=%d out of range; using 0\n", mode);
+		mode = 0;
+	}
+
+	/* Always re-sample: it is a handful of MMIO reads, and ag->dev_ready is reported
+	 * below even when the value itself is not used. */
+	agnic_refresh_dev_mac(ag);
+
+	dev_ok = is_valid_ether_addr(ag->mac);
+	if (dev_ok)
+		dev_ent = (ag->mac[3] << 16) | (ag->mac[4] << 8) | ag->mac[5];
+	dmi_ok = (mode != 2) && agnic_dmi_entropy(&dmi_ent);
+
+	if (mode == 2) {
+		ent = 0;
+		src = "fixed (mac_src=2)";
+	} else if (mode == 1 && dev_ok) {
+		ent = dev_ent;
+		src = "NPU device MAC";
+	} else if (dmi_ok) {
+		ent = dmi_ent;
+		src = "host DMI";
+	} else if (dev_ok) {
+		ent = dev_ent;
+		src = "NPU device MAC";
+	} else {
+		ent = 0;
+		src = "no per-unit source; fixed fallback";
+	}
+
+	base[0] = 0x02;			/* locally administered, unicast */
+	base[1] = 0x81;			/* mnemonic echo of the pport tag base */
+	base[2] = (ent >> 16) & 0xff;
+	base[3] = (ent >> 8) & 0xff;
+	base[4] = ent & 0xff;
+	base[5] = 0;			/* caller stamps the port number */
+
+	/* dev_ready is reported because it is the difference between "the device MAC was
+	 * rejected" and "the device MAC was never readable". Without it, a unit that falls
+	 * back cannot be told apart from one whose NPU had not set DEV_READY yet. */
+	if (ent) {
+		dev_info(ag->dev, "P4: port MAC base %pM (port in last octet) from %s [DEV_READY=%d]\n",
+			 base, src, ag->dev_ready);
+	} else {
+		/* Not a success: every unit that lands here carries the same nine addresses,
+		 * which is the collision this derivation exists to remove. */
+		dev_warn(ag->dev,
+			 "P4: port MAC base %pM (port in last octet) — %s; NOT unique to this appliance [DEV_READY=%d]\n",
+			 base, src, ag->dev_ready);
+	}
 }
 
 /*
