@@ -1,6 +1,6 @@
 Image  20652544  5705c1168ee4a39948fab5ba8c326cb1c5812f5a70fd03090ad4f7cdc6e26bd0
 cn9130-Sophos-XGS116.dtb  29728  d2d07d1a374d5ba6116ed2cdd9108e1ce08092c01649712d45ed8be8eef37d2d
-rootfs-dp.tar  6533632  d027558c4e1b34b88fa740e9204e1921d5357d1c352060585559e34f6e676393
+rootfs-dp.tar  9359360  c7ef6d2e06322261e7d33bb713e9733fdf86788aacd7687e2b153d3352a9522d
 # dp_fwd inside rootfs-dp.tar: 626504 bytes, md5 35c35a3c19311efd2b529a7693e76cd4
 # /opt/dp/modules/musdk_cma.ko: 344384 bytes, sha256 d50e35dfa9d0276bafadbcf8f96d2d6ed797212fd5a81c73217f5ed50d32ec49
 # /opt/dp/modules/mv_dmax2_uio.ko: 296504 bytes, sha256 9a64bcaa970e52816e5081a1e554ab1b730891ceaf54cf15b7539aae5f0ac114
@@ -9,3 +9,4 @@ rootfs-dp.tar  6533632  d027558c4e1b34b88fa740e9204e1921d5357d1c352060585559e34f
 # /opt/dp/sfp-init.sh: 3396 bytes, md5 4587306f1b36ac660e89082e514b9278 (from npu/live/)
 # /opt/dp/sw-init.sh: 10075 bytes, md5 91dd04399d0c3c332f20ea99ffdeaa16 (from npu/live/)
 # /opt/dp/swmdio.sh: 3544 bytes, md5 ea30b7e12c90bceebeeec7779e5e3062 (from npu/live/)
+# aarch64 glibc runtime inside rootfs-dp.tar (DEBT #217), built from source by mamoru_npu_sysroot_aarch64_defconfig: ld-linux-aarch64.so.1 libc.so.6 libm.so.6 libpthread.so.0 librt.so.1
