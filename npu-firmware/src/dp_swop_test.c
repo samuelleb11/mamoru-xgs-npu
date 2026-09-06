@@ -135,6 +135,55 @@ static uint8_t stub_sff_read(const struct dp_sff_cage *cage, uint8_t *raw, uint8
 }
 
 /*
+ * Substitute CROSS-CHECK SOURCE, installed for section 17. It replaces the TRANSPORT ONLY -- the
+ * i2c reads and the sysfs parentage walk, neither of which exists on a build host -- and NOT the
+ * classifier. Every three-state decision under test below is therefore the shipping one.
+ *
+ * This is the only way the SHARED-DEVICE case can be reached at all: it requires a board whose
+ * cage pins hang off an i2c GPIO expander on the EEPROM's own bus, which is not this board and
+ * may never be one we own. That case is also the single most important row in this file, because
+ * it is the one that will still be true after somebody moves these pins.
+ */
+static struct dp_sff_xsrc stub_xsrc;
+
+static void xsrc_set(int adapter, int a0_ok, uint8_t dmt, uint8_t enh, int a2_ok, uint8_t status)
+{
+	stub_xsrc.gpio_i2c_adapter = adapter;
+	stub_xsrc.a0_ok = a0_ok;
+	stub_xsrc.a0_dmt = dmt;
+	stub_xsrc.a0_enh = enh;
+	stub_xsrc.a2_ok = a2_ok;
+	stub_xsrc.a2_status = status;
+	dp_sff_test_set_xsrc(&stub_xsrc);
+}
+
+/* A module that is present, has diagnostics, and maintains both status bits. The DEFAULT
+ * healthy source, so a row that needs one of these OFF says so by turning it off. */
+#define XSRC_DMT_OK	((uint8_t)SFF8472_DMT_DDM_IMPLEMENTED)
+#define XSRC_ENH_OK	((uint8_t)(SFF8472_ENH_SOFT_RX_LOS_MON | SFF8472_ENH_SOFT_TX_DIS))
+
+/*
+ * THE THREE STATES MUST STAY THREE. Asserted on EVERY classifier row rather than on a chosen
+ * few: the failure this feature exists to prevent is one state being quietly folded into
+ * another, and a fold is invisible unless disjointness and completeness are checked every time.
+ */
+static void xchk_three_states(const struct dp_sff_xchk *x, uint8_t want, const char *who)
+{
+	char m[160];
+	uint8_t w = (uint8_t)(want & DP_SFF_XCHK_PINS);
+
+	snprintf(m, sizeof(m), "%s: agreed/disagreed/nocheck are pairwise DISJOINT", who);
+	ck((uint8_t)(x->agreed & x->disagreed) == 0 &&
+	   (uint8_t)(x->agreed & x->nocheck) == 0 &&
+	   (uint8_t)(x->disagreed & x->nocheck) == 0, m);
+	snprintf(m, sizeof(m), "%s: the three states COVER every pin asked about", who);
+	ck((uint8_t)(x->agreed | x->disagreed | x->nocheck) == w, m);
+	snprintf(m, sizeof(m), "%s: no pin outside DP_SFF_XCHK_PINS is ever classified", who);
+	ck((uint8_t)((x->agreed | x->disagreed | x->nocheck) &
+		     (uint8_t)~(unsigned)DP_SFF_XCHK_PINS) == 0, m);
+}
+
+/*
  * The invariants the HOST re-derives on every SFP reply (agnic_swop_sfp_fault), checked here so
  * a polarity or mask error is caught by this suite rather than by an operator wondering why an
  * empty cage reports a module. Re-derived from the wire contract, not copied from a header this
@@ -820,6 +869,281 @@ int main(void)
 		 * environment answering, not the resolver being exercised. 16e is what actually
 		 * measures the resolution rule; the Linux chardev/sysfs code below it compiles
 		 * only on Linux and is proven by nothing in this file. */
+	}
+
+	/* 17. THE A2 CROSS-CHECK — two transports, three states, and an independence property
+	 *     that is ESTABLISHED at runtime rather than asserted in a comment.
+	 *
+	 *     WHY IT EXISTS. Section 16 proves the handler reports what the GPIO lines read.
+	 *     Nothing in it establishes that those pads are in GPIO FUNCTION at all, and on a pad
+	 *     whose function has not been established NEITHER LEVEL IS EVIDENCE: a pad held in a
+	 *     peripheral function reads LOW, and an open-drain i2c pad idling on its pull-up reads
+	 *     HIGH — which is exactly what an asserted active-high TX_DISABLE looks like. Two of
+	 *     the four pins are readable a second time from the module itself over i2c, and that
+	 *     is what settles it.
+	 *
+	 *     THE ORDER IS THE SAME AS 16's AND FOR THE SAME REASON: the pure predicates and the
+	 *     comparator's own can-it-fail proof come FIRST, then the classifier's refusals, then
+	 *     an acceptance. A cross-check that cannot fail is strictly worse than none, because
+	 *     it is trusted — and "it never disagrees" is exactly what that looks like.
+	 */
+	{
+		struct dp_swop_resp p;
+		struct dp_swop_req  sq;
+		struct dp_sff_xchk  x;
+		const uint8_t both = (uint8_t)(DP_SWOP_SFP_PIN_RX_LOS | DP_SWOP_SFP_PIN_TX_DISABLE);
+
+		/* ---- 17a. THE SFF-8472 BIT POSITIONS, as known-value controls --------------
+		 * Asserted at their source, exactly as the pin table's LINE NUMBERS are: a
+		 * transposed bit reads a REAL bit of a REAL status byte and answers confident
+		 * nonsense, with nothing in a reply to contradict it. Public MSA only. */
+		ck(SFF8472_A0_DMT == 92u && SFF8472_A0_ENHANCED == 93u,
+		   "SFF-8472: Diagnostic Monitoring Type is A0h byte 92, Enhanced Options 93");
+		ck(SFF8472_DMT_DDM_IMPLEMENTED == 0x40u,
+		   "SFF-8472 Table 8-5: DDM implemented is byte 92 BIT 6");
+		ck(SFF8472_DMT_ADDR_CHANGE_REQ == 0x04u,
+		   "SFF-8472 Table 8-5: address change required is byte 92 BIT 2");
+		ck(SFF8472_ENH_SOFT_TX_DIS == 0x40u,
+		   "SFF-8472 Table 8-6: soft TX_DISABLE control+monitoring is byte 93 BIT 6");
+		ck(SFF8472_ENH_SOFT_RX_LOS_MON == 0x10u,
+		   "SFF-8472 Table 8-6: soft RX_LOS monitoring is byte 93 BIT 4");
+		ck(SFF8472_A2_STATUS == 110u,
+		   "SFF-8472 Table 9-11: Status/Control is A2h byte 110 (0x6e)");
+		ck(SFF8472_SC_TX_DISABLE_PIN == 0x80u,
+		   "SFF-8472 Table 9-11: TX Disable STATE (the pin) is byte 110 BIT 7");
+		ck(SFF8472_SC_RX_LOS_PIN == 0x02u,
+		   "SFF-8472 Table 9-11: RX_LOS STATE (the pin) is byte 110 BIT 1");
+		ck(DP_SFF_XCHK_PINS == both,
+		   "exactly TWO of the four phase-A pins are cross-checkable — no coverage is implied for the others");
+		ck((DP_SFF_XCHK_PINS & (DP_SWOP_SFP_PIN_PRESENT | DP_SWOP_SFP_PIN_TX_FAULT)) == 0,
+		   "present is a BOARD signal and tx_fault is not cross-checked; neither is claimed");
+
+		/* ---- 17b. THE DESCRIPTOR'S i2c ROW ---------------------------------------- */
+		{
+			const struct dp_sff_cage *c9 = dp_sff_cage_for_dev(0x09);
+
+			ck(c9 != NULL, "the cage is still there to carry an i2c descriptor");
+			if (c9) {
+				/* `i2c1:2:0x50` parsed with the vendor's literal "i2c1:%i:%i":
+				 * `i2c1` is a FIXED PREFIX TOKEN and the FIRST number is the
+				 * BUS. Bus 1 does not exist on this box — the DTB disables that
+				 * controller — so a default of 1 opens nothing. */
+				ck(c9->i2c_bus == 2,
+				   "the cage's EEPROM is on BUS 2, not bus 1 (the prefix-token parse)");
+				ck(c9->i2c_a0 == 0x50 && c9->i2c_a2 == 0x51,
+				   "A0 is 0x50 and A2 is 0x51 — no mux, measured 2026-09-06");
+			}
+		}
+
+		/* ---- 17c. INDEPENDENCE, as a truth table ----------------------------------
+		 * THE ROW THAT MATTERS MOST IS THE SHARED ONE. If the cage pins are ever
+		 * resolved through an i2c GPIO expander on the EEPROM's own bus, the two
+		 * transports become ONE READING COUNTED TWICE and the check reports AGREED, with
+		 * total confidence, on every pin, forever. */
+		ck(dp_sff_xchk_independent(DP_SFF_I2C_ADAPTER_NONE, 2) == 1,
+		   "a gpiochip on NO i2c adapter is a genuinely different transport (today's board)");
+		ck(dp_sff_xchk_independent(2, 2) == 0,
+		   "SHARED ADAPTER: an expander on the EEPROM's own bus is NOT two transports");
+		ck(dp_sff_xchk_independent(0, 0) == 0,
+		   "...and that holds on adapter 0 too — not a `!= 0` test in disguise");
+		ck(dp_sff_xchk_independent(5, 2) == 1,
+		   "a DIFFERENT i2c adapter is still a different controller, so still independent");
+		ck(dp_sff_xchk_independent(DP_SFF_I2C_ADAPTER_UNKNOWN, 2) == 0,
+		   "UNDETERMINED parentage FAILS CLOSED — unknown is not independence");
+		ck(DP_SFF_I2C_ADAPTER_NONE != DP_SFF_I2C_ADAPTER_UNKNOWN,
+		   "'not on i2c' and 'could not tell' are DIFFERENT answers");
+
+		/* ---- 17d. THE COMPARATOR'S OWN PROOF THAT IT CAN FAIL ---------------------- */
+		ck(dp_sff_xchk_comparator_proven() == 1,
+		   "the comparator rejects a known-bad pair, accepts a known-good one, and does not answer for a pin it was not asked about");
+
+		/* ---- 17e. THE CLASSIFIER, refusals first ----------------------------------
+		 * Every row here must land in NOCHECK. Not in `agreed` (which would manufacture
+		 * corroboration) and not in `disagreed` (which would clear the valid bit of a
+		 * pin that was read perfectly well) — the two opposite ways to lose the third
+		 * state. */
+		xsrc_set(DP_SFF_I2C_ADAPTER_NONE, 1, XSRC_DMT_OK, XSRC_ENH_OK, 0, 0);
+		dp_sff_xchk_classify(&stub_xsrc, 2, 0x03, both, &x);
+		ck(x.nocheck == both && x.agreed == 0 && x.disagreed == 0,
+		   "A2 DID NOT ANSWER -> not cross-checkable. An i2c failure is NOT a disagreement");
+		xchk_three_states(&x, both, "a2 absent");
+
+		xsrc_set(DP_SFF_I2C_ADAPTER_NONE, 0, XSRC_DMT_OK, XSRC_ENH_OK, 1, 0x00);
+		dp_sff_xchk_classify(&stub_xsrc, 2, 0x03, both, &x);
+		ck(x.nocheck == both && x.disagreed == 0,
+		   "A0 did not answer -> the capability bytes are unknown, so nothing is checked");
+		xchk_three_states(&x, both, "a0 absent");
+
+		xsrc_set(DP_SFF_I2C_ADAPTER_NONE, 1, 0x00, XSRC_ENH_OK, 1, 0x00);
+		dp_sff_xchk_classify(&stub_xsrc, 2, 0x03, both, &x);
+		ck(x.nocheck == both && x.disagreed == 0,
+		   "no DDM (A0 byte 92 bit 6 clear) -> there is no A2 page, so 0x51 answered something else");
+		xchk_three_states(&x, both, "no ddm");
+
+		xsrc_set(DP_SFF_I2C_ADAPTER_NONE, 1,
+			 (uint8_t)(XSRC_DMT_OK | SFF8472_DMT_ADDR_CHANGE_REQ), XSRC_ENH_OK, 1, 0x00);
+		dp_sff_xchk_classify(&stub_xsrc, 2, 0x03, both, &x);
+		ck(x.nocheck == both && x.disagreed == 0,
+		   "address change REQUIRED -> A2 is not simply at 0x51; refuse rather than improvise");
+		xchk_three_states(&x, both, "addr change required");
+
+		xsrc_set(DP_SFF_I2C_ADAPTER_NONE, 1, XSRC_DMT_OK, 0x00, 1, 0x00);
+		dp_sff_xchk_classify(&stub_xsrc, 2, 0x03, both, &x);
+		ck(x.nocheck == both && x.disagreed == 0,
+		   "the module maintains NEITHER status bit (A0 byte 93) -> checking would manufacture a disagreement");
+		xchk_three_states(&x, both, "no enhanced options");
+
+		/* THE SHARED-DEVICE CASE, and it is constructed with values that AGREE. That is
+		 * the whole point: a same-bus expander would return the SAME reading, so the
+		 * naive check reports AGREED and can never fail. It must land in NOCHECK. */
+		xsrc_set(2, 1, XSRC_DMT_OK, XSRC_ENH_OK, 1, SFF8472_SC_RX_LOS_PIN);
+		dp_sff_xchk_classify(&stub_xsrc, 2, DP_SWOP_SFP_PIN_RX_LOS, both, &x);
+		ck(x.nocheck == both,
+		   "SHARED DEVICE: a gpiochip on the EEPROM's own adapter is NOT CROSS-CHECKABLE");
+		ck(x.agreed == 0,
+		   "...and it is NOT counted as AGREED, even though the two values match — one reading counted twice is not corroboration");
+		xchk_three_states(&x, both, "shared adapter");
+		/* ...and the SAME source on a DIFFERENT adapter DOES cross-check. Without this
+		 * the row above would pass for a classifier that never checks anything. */
+		xsrc_set(5, 1, XSRC_DMT_OK, XSRC_ENH_OK, 1, SFF8472_SC_RX_LOS_PIN);
+		dp_sff_xchk_classify(&stub_xsrc, 2, DP_SWOP_SFP_PIN_RX_LOS, both, &x);
+		ck(x.agreed == both && x.nocheck == 0,
+		   "...while the same bytes on ANOTHER adapter DO cross-check — the shared row is about sharing, not about refusing everything");
+		xchk_three_states(&x, both, "different adapter");
+
+		/* ---- 17f. THE CLASSIFIER, acceptances ------------------------------------- */
+		/* THE REAL APPLIANCE BYTE. `i2cget -y 2 0x51 0x6e` returned 0x02 on the
+		 * AFBR-703SDZ-IN2 in the F1 cage, 2026-09-06: RX_LOS asserted, TX_DISABLE pin
+		 * clear. The GPIO side of that same reading is section 16g's seated+rx_los case,
+		 * whose normalised `logical` is 0x03. They AGREE. */
+		xsrc_set(DP_SFF_I2C_ADAPTER_NONE, 1, XSRC_DMT_OK, XSRC_ENH_OK, 1, 0x02);
+		dp_sff_xchk_classify(&stub_xsrc, 2, 0x03, both, &x);
+		ck(x.agreed == both && x.disagreed == 0 && x.nocheck == 0,
+		   "the MEASURED appliance byte 0x02 agrees with the GPIO reading on both pins");
+		xchk_three_states(&x, both, "measured agreement");
+
+		/* DISAGREEMENT ON RX_LOS: the module says light is arriving, the pad says it is
+		 * not. That is the muxed-or-dead-pad signature. */
+		xsrc_set(DP_SFF_I2C_ADAPTER_NONE, 1, XSRC_DMT_OK, XSRC_ENH_OK, 1, 0x00);
+		dp_sff_xchk_classify(&stub_xsrc, 2, 0x03, both, &x);
+		ck(x.disagreed == DP_SWOP_SFP_PIN_RX_LOS,
+		   "A2 says light IS arriving while the pad says LOS -> RX_LOS DISAGREES");
+		ck(x.agreed == DP_SWOP_SFP_PIN_TX_DISABLE,
+		   "...and the OTHER pin, which does agree, is not condemned with it");
+		xchk_three_states(&x, both, "rx_los disagrees");
+
+		/* DISAGREEMENT ON TX_DISABLE, whose A2 bit is at a different position. This is
+		 * the one whose two sides have genuinely different ORIGINS: we drive the pin, the
+		 * module reports what it sees on it. */
+		xsrc_set(DP_SFF_I2C_ADAPTER_NONE, 1, XSRC_DMT_OK, XSRC_ENH_OK, 1,
+			 (uint8_t)(SFF8472_SC_TX_DISABLE_PIN | SFF8472_SC_RX_LOS_PIN));
+		dp_sff_xchk_classify(&stub_xsrc, 2, 0x03, both, &x);
+		ck(x.disagreed == DP_SWOP_SFP_PIN_TX_DISABLE,
+		   "the module sees TX_DISABLE asserted while we drive it low -> TX_DISABLE DISAGREES");
+		ck(x.agreed == DP_SWOP_SFP_PIN_RX_LOS, "...and RX_LOS still agrees");
+		xchk_three_states(&x, both, "tx_disable disagrees");
+
+		/* PER-PIN CAPABILITY: a module maintaining only the TX_DISABLE bit gets exactly
+		 * one pin cross-checked and the other left as the single-transport reading it
+		 * always was — NOT condemned, and NOT credited. */
+		xsrc_set(DP_SFF_I2C_ADAPTER_NONE, 1, XSRC_DMT_OK, SFF8472_ENH_SOFT_TX_DIS, 1, 0x00);
+		dp_sff_xchk_classify(&stub_xsrc, 2, 0x03, both, &x);
+		ck(x.nocheck == DP_SWOP_SFP_PIN_RX_LOS,
+		   "a module that does not maintain the RX_LOS bit leaves that pin NOT CROSS-CHECKABLE");
+		ck(x.agreed == DP_SWOP_SFP_PIN_TX_DISABLE && x.disagreed == 0,
+		   "...while the bit it DOES maintain is still checked");
+		xchk_three_states(&x, both, "rx_los cap absent");
+
+		/* A pin outside the cross-checkable set may not be classified at all, however
+		 * loudly the caller asks — that would be claiming coverage this firmware lacks. */
+		xsrc_set(DP_SFF_I2C_ADAPTER_NONE, 1, XSRC_DMT_OK, XSRC_ENH_OK, 1, 0xff);
+		dp_sff_xchk_classify(&stub_xsrc, 2, 0x0f, DP_SWOP_SFP_PINS_PHASE_A, &x);
+		xchk_three_states(&x, DP_SWOP_SFP_PINS_PHASE_A, "present/tx_fault asked for");
+		ck((uint8_t)((x.agreed | x.disagreed | x.nocheck) &
+			     (DP_SWOP_SFP_PIN_PRESENT | DP_SWOP_SFP_PIN_TX_FAULT)) == 0,
+		   "present and tx_fault are NEVER cross-checked, even when asked for");
+		dp_sff_xchk_classify(&stub_xsrc, 2, 0x0f, 0, &x);
+		ck(x.agreed == 0 && x.disagreed == 0 && x.nocheck == 0,
+		   "nothing asked -> nothing classified (and no bus transaction is worth making)");
+
+		/* ---- 17g. THROUGH THE HANDLER — what a disagreement does to `valid` -------- */
+		dp_sff_test_set_read(stub_sff_read);
+		stub_sff_status = DP_SWOP_OK;
+		stub_sff_raw = DP_SWOP_SFP_PIN_RX_LOS;		/* seated (active low), LOS */
+		stub_sff_ok = DP_SWOP_SFP_PINS_PHASE_A;
+		sq = mkreq(DP_SWOP_OP_SFP, 0x09, DP_SWOP_SFP_PAGE_PINS, 0);
+
+		/* AGREEMENT changes nothing — the reply is exactly what section 16g asserts. */
+		xsrc_set(DP_SFF_I2C_ADAPTER_NONE, 1, XSRC_DMT_OK, XSRC_ENH_OK, 1, 0x02);
+		p = run(sq, sizeof(q));
+		ck(p.status == DP_SWOP_OK && p.sfp.valid == DP_SWOP_SFP_PINS_PHASE_A,
+		   "AGREED: two transports corroborate, and all four pins stay measurements");
+		sfp_wire_invariants(&p, &sq, "xchk agreed");
+
+		/* DISAGREEMENT clears exactly that pin's `valid` bit. */
+		xsrc_set(DP_SFF_I2C_ADAPTER_NONE, 1, XSRC_DMT_OK, XSRC_ENH_OK, 1, 0x00);
+		p = run(sq, sizeof(q));
+		ck(p.status == DP_SWOP_OK, "a disagreement is not an error — the reply still stands");
+		ck((p.sfp.valid & DP_SWOP_SFP_PIN_RX_LOS) == 0,
+		   "DISAGREED: rx_los has NOT been validly measured, so its valid bit CLEARS");
+		ck((p.sfp.implemented & DP_SWOP_SFP_PIN_RX_LOS) != 0,
+		   "...while implemented STAYS SET — wired-but-unmeasured, absence case (c), which the host renders distinctly from a pin reading 0");
+		ck((p.sfp.valid & DP_SWOP_SFP_PIN_TX_DISABLE) != 0 &&
+		   (p.sfp.valid & DP_SWOP_SFP_PIN_PRESENT) != 0,
+		   "...and only the disagreeing pin is condemned");
+		ck((p.sfp.raw & DP_SWOP_SFP_PIN_RX_LOS) != 0,
+		   "...the RAW level is still carried outside valid, for debugging — as case (b) already does");
+		sfp_wire_invariants(&p, &sq, "xchk disagreed");
+
+		/* NO WINNER IS PICKED. The A2 byte said "light is arriving"; the reply does not
+		 * adopt it. It says only that this pin was not validly measured. */
+		ck((p.sfp.logical & DP_SWOP_SFP_PIN_RX_LOS) != 0,
+		   "the GPIO reading is NOT overwritten with the module's — no winner is picked between transports");
+
+		/* AN i2c FAILURE MUST NOT CLEAR ANYTHING. This is the row that separates this
+		 * change from a regression: an absent or silent module leaves the GPIO reading as
+		 * the only evidence, exactly as before the cross-check existed. */
+		xsrc_set(DP_SFF_I2C_ADAPTER_NONE, 1, XSRC_DMT_OK, XSRC_ENH_OK, 0, 0);
+		p = run(sq, sizeof(q));
+		ck(p.sfp.valid == DP_SWOP_SFP_PINS_PHASE_A,
+		   "NOT CROSS-CHECKABLE (A2 silent): valid is UNTOUCHED — a failure is not a disagreement");
+		sfp_wire_invariants(&p, &sq, "xchk a2 silent");
+
+		/* SHARED DEVICE, through the handler, with a byte that DISAGREES. It must be
+		 * ignored: a same-bus expander is not a second transport in either direction. */
+		xsrc_set(2, 1, XSRC_DMT_OK, XSRC_ENH_OK, 1, 0x00);
+		p = run(sq, sizeof(q));
+		ck(p.sfp.valid == DP_SWOP_SFP_PINS_PHASE_A,
+		   "SHARED DEVICE through the handler: nothing is cross-checked, so nothing is cleared");
+		sfp_wire_invariants(&p, &sq, "xchk shared device");
+
+		/* AN EMPTY CAGE has already dropped rx_los/tx_disable from `valid` (case b), so
+		 * `want` is empty and a disagreeing byte cannot reach anything. Order proof: the
+		 * cross-check runs AFTER the (b) clamp and neither resurrects nor damages it. */
+		stub_sff_raw = DP_SWOP_SFP_PINS_PHASE_A;	/* nothing seated */
+		xsrc_set(DP_SFF_I2C_ADAPTER_NONE, 1, XSRC_DMT_OK, XSRC_ENH_OK, 1, 0x00);
+		p = run(sq, sizeof(q));
+		ck(p.sfp.valid == DP_SWOP_SFP_PIN_PRESENT,
+		   "empty cage: the (b) clamp already stands, and the cross-check neither adds to nor removes from it");
+		sfp_wire_invariants(&p, &sq, "xchk empty cage");
+		stub_sff_raw = DP_SWOP_SFP_PIN_RX_LOS;
+
+		/* ---- 17h. SEAM RESTORE, as a positive control -----------------------------
+		 * A disagreeing source is left installed right up to here. If the restore did not
+		 * take, this row would still see it and rx_los would still be condemned — so a
+		 * dead seam shows up as a RED here rather than as every later row testing a mock.
+		 */
+		dp_sff_test_set_xsrc(NULL);
+		p = run(sq, sizeof(q));
+		ck(p.sfp.valid == DP_SWOP_SFP_PINS_PHASE_A,
+		   "seam restored: the REAL gather runs, finds no i2c and no parentage on a build host, and clears nothing");
+		sfp_wire_invariants(&p, &sq, "xchk seam restored");
+		dp_sff_test_set_read(NULL);
+		/* HONEST LIMIT, stated rather than implied: on a build host that last row is the
+		 * ENVIRONMENT answering — no gpiochip, no /dev/i2c-2 — not the i2c transaction or
+		 * the sysfs parentage walk being exercised. Those compile only on Linux and are
+		 * proven by NOTHING in this file. 17c-17f are what actually measure the three-state
+		 * logic; the transport is a hardware reading and is requested as one. */
 	}
 
 	/* 9. NEGATIVE CONTROL — prove this harness can FAIL. Without it a green run

@@ -65,6 +65,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/gpio.h>
+/* The KERNEL's UAPI i2c headers, not i2c-tools'. `linux/i2c.h` carries struct i2c_msg and
+ * I2C_M_RD; `linux/i2c-dev.h` carries I2C_RDWR and struct i2c_rdwr_ioctl_data. Both have been
+ * exported UAPI since long before 4.14, so this adds no package dependency to the NPU image --
+ * which matters, because the vendor `libsbsp.so.1` this kit deliberately does not link is
+ * MISSING on the appliance and a second unresolvable dependency would be the same mistake. */
+#include <linux/i2c.h>
+#include <linux/i2c-dev.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
@@ -107,7 +114,16 @@ static const struct dp_sff_pin sff_xgs116_f1_pins[] = {
 /* One cage on this board. A second entry — another port, or another board's file — is the only
  * change a multi-cage box needs, which is why the wire contract is per-port. */
 static const struct dp_sff_cage sff_cages[] = {
-	{ 0x09, sff_xgs116_f1_pins, SFF_COUNT(sff_xgs116_f1_pins) }
+	/*                                                       bus   A0     A2
+	 * Ground truth, AMDA0208-0001R00.txt: `npu0.phy8.SFF-8431=i2c1:2:0x50`, parsed with the
+	 * vendor's literal "i2c1:%i:%i" -- `i2c1` is a FIXED PREFIX TOKEN and the FIRST number is
+	 * the BUS. So: /dev/i2c-2, A0 at 0x50, A2 at 0x51, NO MUX. Measured on the appliance
+	 * 2026-09-06: both addresses answer i2cdetect on bus 2, `i2cget -y 2 0x51 0x6e` returned
+	 * 0x02, and /dev/i2c-1 DOES NOT EXIST (that controller is status="disabled" in the DTB),
+	 * so a default of bus 1 would open nothing. A2 is 0x51 = A0 + 1 by SFF-8472, but it is
+	 * written out rather than derived: a derived address is a second convention to get wrong.
+	 */
+	{ 0x09, sff_xgs116_f1_pins, SFF_COUNT(sff_xgs116_f1_pins), 2, 0x50, 0x51 }
 };
 
 /*
@@ -208,6 +224,142 @@ uint8_t dp_sff_active_low(const struct dp_sff_cage *cage)
 	return m;
 }
 
+/* ---- THE CROSS-CHECK, PORTABLE HALF -------------------------------------------------------
+ *
+ * Everything that DECIDES anything lives here and compiles everywhere, so the three-state logic
+ * is exercised by the unit suite on a build host rather than only on the appliance. The Linux
+ * half below is transport only: it gathers bytes and a parentage, and decides nothing.
+ */
+
+/*
+ * Which of `pins` the two transports DISAGREE about.
+ *
+ * `logical` is the NORMALISED, active-high GPIO reading; the A2 status bits are already in that
+ * domain (SFF-8472 defines them as the digital state of the pin, and both of these pins are
+ * active high in the SFF sense), so there is no polarity step here and deliberately so -- a
+ * second place holding polarity is a second place for it to be wrong.
+ */
+static uint8_t sff_xchk_compare(uint8_t a2_status, uint8_t logical, uint8_t pins)
+{
+	uint8_t a2 = 0;
+
+	if (a2_status & SFF8472_SC_RX_LOS_PIN)
+		a2 = (uint8_t)(a2 | DP_SWOP_SFP_PIN_RX_LOS);
+	if (a2_status & SFF8472_SC_TX_DISABLE_PIN)
+		a2 = (uint8_t)(a2 | DP_SWOP_SFP_PIN_TX_DISABLE);
+	return (uint8_t)((a2 ^ logical) & pins);
+}
+
+int dp_sff_xchk_comparator_proven(void)
+{
+	/* KNOWN-BAD: A2 says RX_LOS asserted, the GPIO says clear. Must DISAGREE. */
+	if (sff_xchk_compare(SFF8472_SC_RX_LOS_PIN, 0, DP_SWOP_SFP_PIN_RX_LOS) !=
+	    DP_SWOP_SFP_PIN_RX_LOS)
+		return 0;
+	/* KNOWN-GOOD: both say asserted. Must AGREE. A comparator that only ever returns
+	 * "disagree" would pass the row above and fail here. */
+	if (sff_xchk_compare(SFF8472_SC_RX_LOS_PIN, DP_SWOP_SFP_PIN_RX_LOS,
+			     DP_SWOP_SFP_PIN_RX_LOS) != 0)
+		return 0;
+	/* ...and both again for TX_DISABLE, whose A2 bit is at a DIFFERENT position (7, not 1).
+	 * One pin's rows passing says nothing about the other's bit being mapped correctly. */
+	if (sff_xchk_compare(SFF8472_SC_TX_DISABLE_PIN, 0, DP_SWOP_SFP_PIN_TX_DISABLE) !=
+	    DP_SWOP_SFP_PIN_TX_DISABLE)
+		return 0;
+	if (sff_xchk_compare(SFF8472_SC_TX_DISABLE_PIN, DP_SWOP_SFP_PIN_TX_DISABLE,
+			     DP_SWOP_SFP_PIN_TX_DISABLE) != 0)
+		return 0;
+	/* CROSS-WIRING CONTROL: one pin's A2 bit must not answer for the OTHER pin. A
+	 * transposition of the two bit positions passes every row above and fails this one. */
+	if (sff_xchk_compare(SFF8472_SC_RX_LOS_PIN, 0, DP_SWOP_SFP_PIN_TX_DISABLE) != 0)
+		return 0;
+	if (sff_xchk_compare(SFF8472_SC_TX_DISABLE_PIN, 0, DP_SWOP_SFP_PIN_RX_LOS) != 0)
+		return 0;
+	/* AND IT MUST NOT ANSWER FOR A PIN IT WAS NOT ASKED ABOUT. `pins` is a real mask, not a
+	 * hint: a comparator ignoring it would clear the valid bit of a pin nobody cross-checked. */
+	if (sff_xchk_compare(0xffu, 0x00u, 0) != 0)
+		return 0;
+	return 1;
+}
+
+int dp_sff_xchk_independent(int gpio_i2c_adapter, int eeprom_i2c_bus)
+{
+	/* UNDETERMINED IS NOT INDEPENDENT. This is the fail-closed direction on purpose: the
+	 * cost of being wrong here is a check that CANNOT FAIL and is trusted, which is strictly
+	 * worse than no check. The cost of being wrong the other way is a pin that stays a
+	 * single-transport reading -- exactly what it was before this feature existed. */
+	if (gpio_i2c_adapter == DP_SFF_I2C_ADAPTER_UNKNOWN)
+		return 0;
+	/* The gpiochip is not on any i2c adapter at all -- today's XGS 116 case, where the pins
+	 * are lines on a CP0 system-controller block reached over MMIO. Different silicon. */
+	if (gpio_i2c_adapter == DP_SFF_I2C_ADAPTER_NONE)
+		return 1;
+	/* It IS an i2c-backed gpiochip. Independent only if it is on a DIFFERENT adapter from the
+	 * one carrying the EEPROM. Same adapter == ONE READING COUNTED TWICE. */
+	return gpio_i2c_adapter != eeprom_i2c_bus;
+}
+
+void dp_sff_xchk_classify(const struct dp_sff_xsrc *src, int eeprom_i2c_bus, uint8_t logical,
+			  uint8_t want, struct dp_sff_xchk *out)
+{
+	uint8_t cando = 0, diff;
+
+	out->agreed = 0;
+	out->disagreed = 0;
+	/* START PESSIMISTIC. Every pin asked about is NOT CROSS-CHECKABLE until something below
+	 * moves it, so every `return` on this function's failure paths lands in the third state
+	 * by construction rather than by remembering to. */
+	out->nocheck = (uint8_t)(want & DP_SFF_XCHK_PINS);
+	if (!out->nocheck || !src)
+		return;
+
+	/* THE GATE PROVES IT CAN FAIL, ON THIS REPLY, BEFORE IT IS BELIEVED. Costs a handful of
+	 * instructions and converts "the comparator works" from an assumption into a
+	 * measurement -- in production, not in a test nobody reruns. */
+	if (!dp_sff_xchk_comparator_proven())
+		return;
+
+	/* INDEPENDENCE. If the gpiochip hangs off the same i2c adapter as the EEPROM, these are
+	 * not two transports and an "agreement" would be a number compared with itself. */
+	if (!dp_sff_xchk_independent(src->gpio_i2c_adapter, eeprom_i2c_bus))
+		return;
+
+	/* AN i2c FAILURE IS NOT A DISAGREEMENT. No module, a bus NAK, an adapter that will not
+	 * open: each leaves the GPIO reading as the only evidence and must NOT clear `valid`. And
+	 * a byte that was never read must never be substituted with 0x00 -- SFF-8472 gives 0x00
+	 * meanings, so a zero from a bus that did not answer decodes as a plausible wrong answer.
+	 * That substitution is impossible here because a2_status is consulted only under a2_ok. */
+	if (!src->a0_ok || !src->a2_ok)
+		return;
+
+	/* DOES THE MODULE HAVE DIAGNOSTICS AT ALL? A0h byte 92 bit 6 (SFF-8472 Table 8-5). A
+	 * module without DDM has no A2 page, so anything 0x51 returned is not a status byte. */
+	if (!(src->a0_dmt & SFF8472_DMT_DDM_IMPLEMENTED))
+		return;
+	/* ...and if byte 92 bit 2 says the address-change sequence is REQUIRED, the diagnostics
+	 * are not simply at 0x51 and this read addressed something else. Refuse; do not improvise
+	 * an access method against a module that told us the plain one is wrong. */
+	if (src->a0_dmt & SFF8472_DMT_ADDR_CHANGE_REQ)
+		return;
+
+	/* PER-PIN CAPABILITY, from the module's own Enhanced Options byte (A0h byte 93, SFF-8472
+	 * Table 8-6). A module that does not maintain byte 110's RX_LOS or TX_DISABLE state bit
+	 * would otherwise MANUFACTURE a disagreement and clear the valid bit of a pin that was
+	 * read perfectly well -- the false-FAIL mirror of the false-PASS this feature removes. */
+	if (src->a0_enh & SFF8472_ENH_SOFT_RX_LOS_MON)
+		cando = (uint8_t)(cando | DP_SWOP_SFP_PIN_RX_LOS);
+	if (src->a0_enh & SFF8472_ENH_SOFT_TX_DIS)
+		cando = (uint8_t)(cando | DP_SWOP_SFP_PIN_TX_DISABLE);
+	cando = (uint8_t)(cando & out->nocheck);
+	if (!cando)
+		return;
+
+	diff = sff_xchk_compare(src->a2_status, logical, cando);
+	out->disagreed = diff;
+	out->agreed = (uint8_t)(cando & (uint8_t)~(unsigned)diff);
+	out->nocheck = (uint8_t)(out->nocheck & (uint8_t)~(unsigned)cando);
+}
+
 /* ---- line access --------------------------------------------------------------------------- */
 
 /*
@@ -224,9 +376,14 @@ struct sff_chip {
 	uint8_t	bank;
 	int	fd;		/* chardev fd, or -1 */
 	int	base;		/* sysfs base, or -1 */
+	/* The chip's own directory under /sys/class/gpio, e.g. "gpiochip64", or "" if the sysfs
+	 * half did not resolve. Kept because the INDEPENDENCE walk needs the chip's DEVICE
+	 * PARENTAGE and that is only reachable through sysfs -- see sff_gpiochip_i2c_adapter().
+	 * The name is not a base and nothing addresses a line through it. */
+	char	dir[40];
 };
 
-static struct sff_chip sff_chip_cache = { 0, 0, -1, -1 };
+static struct sff_chip sff_chip_cache = { 0, 0, -1, -1, { 0 } };
 
 static void sff_chip_forget(void)
 {
@@ -238,6 +395,7 @@ static void sff_chip_forget(void)
 	sff_chip_cache.bank = 0;
 	sff_chip_cache.fd = -1;
 	sff_chip_cache.base = -1;
+	sff_chip_cache.dir[0] = '\0';
 }
 
 #if defined(__linux__)
@@ -310,13 +468,16 @@ static int sff_chardev_by_label(const char *label)
 
 /* Sysfs: walk /sys/class/gpio/gpiochip*, compare `label`, and take the BASE from that chip's
  * own `base` file rather than from the directory name — same rule, one interface down. */
-static int sff_sysfs_base_by_label(const char *label)
+static int sff_sysfs_base_by_label(const char *label, char *dir_out, size_t dir_len)
 {
 	char path[128], val[64], name[40];
 	struct dirent *e;
 	size_t n;
 	DIR *d;
 	int base = -1;
+
+	if (dir_out && dir_len)
+		dir_out[0] = '\0';
 
 	d = opendir("/sys/class/gpio");
 	if (!d)
@@ -345,8 +506,11 @@ static int sff_sysfs_base_by_label(const char *label)
 		if (strcmp(val, label) != 0)
 			continue;
 		snprintf(path, sizeof(path), "/sys/class/gpio/%s/base", name);
-		if (sff_read_file(path, val, sizeof(val)) > 0)
+		if (sff_read_file(path, val, sizeof(val)) > 0) {
 			base = (int)strtol(val, NULL, 10);
+			if (dir_out && dir_len > n)
+				memcpy(dir_out, name, n + 1);
+		}
 		break;
 	}
 	closedir(d);
@@ -435,7 +599,8 @@ static const struct sff_chip *sff_chip_for_bank(uint8_t bank)
 
 	sff_chip_cache.bank = bank;
 	sff_chip_cache.fd = sff_chardev_by_label(label);
-	sff_chip_cache.base = sff_sysfs_base_by_label(label);
+	sff_chip_cache.base = sff_sysfs_base_by_label(label, sff_chip_cache.dir,
+						      sizeof(sff_chip_cache.dir));
 	if (sff_chip_cache.fd < 0 && sff_chip_cache.base < 0) {
 		/* Not cached: a NEGATIVE result must not become permanent, or a chip that
 		 * appears after a later module load would never be found. */
@@ -453,6 +618,165 @@ static int sff_read_line(const struct sff_chip *chip, uint8_t line, uint8_t driv
 	if (chip->base >= 0 && sff_sysfs_read_line(chip->base, line, out) == 0)
 		return 0;
 	return -1;
+}
+
+/* ---- THE CROSS-CHECK, LINUX TRANSPORT HALF ------------------------------------------------
+ *
+ * Gathers bytes and a device parentage. DECIDES NOTHING -- every three-state judgement is
+ * dp_sff_xchk_classify()'s, above, which compiles and is tested on a build host.
+ */
+
+/*
+ * One short read from an i2c device: write the byte offset, repeated START, read `len` bytes.
+ * I2C_RDWR rather than the SMBus emulation, because that is exactly the two-message transaction
+ * an SFF page read is and it does not depend on the adapter exposing SMBus functionality.
+ *
+ * A FAILURE RETURNS -1 AND WRITES NOTHING. It never returns a zero byte: SFF-8472 assigns
+ * meanings to 0x00, so a zero manufactured from a bus that did not answer decodes as a
+ * plausible, wrong, module-shaped answer -- which is the entire defect this file exists to
+ * remove, re-committed one transport over. On this hardware an absent device is a LOUD EIO
+ * (measured 2026-09-06: `i2cget` on an unpopulated address returns rc=1, not a zero).
+ *
+ * BOUNDED WORK. This runs on dp_fwd's management pump, where an unbounded operation starves the
+ * host handshake and tears the link down (the rule dp_swop.c's SPIN_BUDGET enforces). A whole
+ * cross-check is TWO transactions of at most three bytes each; the fd is opened and closed per
+ * call rather than cached, so a swapped module or a re-probed adapter is never held stale.
+ */
+static int sff_i2c_read(uint8_t bus, uint8_t addr, uint8_t off, uint8_t *buf, uint8_t len)
+{
+	char path[32];
+	struct i2c_msg msg[2];
+	struct i2c_rdwr_ioctl_data xfer;
+	uint8_t reg = off;
+	int fd, rc;
+
+	snprintf(path, sizeof(path), "/dev/i2c-%u", (unsigned)bus);
+	fd = open(path, O_RDWR | O_CLOEXEC);
+	if (fd < 0)
+		return -1;		/* the adapter is not there -- e.g. the DTB disabled it */
+	memset(msg, 0, sizeof(msg));
+	msg[0].addr = addr;
+	msg[0].flags = 0;
+	msg[0].len = 1;
+	msg[0].buf = &reg;
+	msg[1].addr = addr;
+	msg[1].flags = I2C_M_RD;
+	msg[1].len = len;
+	msg[1].buf = buf;
+	xfer.msgs = msg;
+	xfer.nmsgs = 2;
+	rc = ioctl(fd, I2C_RDWR, &xfer);
+	close(fd);
+	return rc < 0 ? -1 : 0;
+}
+
+/*
+ * WHICH i2c ADAPTER, IF ANY, THE RESOLVED GPIOCHIP HANGS OFF -- the runtime half of the
+ * independence property. This is the thing that stops the cross-check quietly becoming one
+ * reading counted twice on the day somebody moves these pins to an i2c GPIO expander.
+ *
+ * /sys/class/gpio/gpiochipN is a SYMLINK into /sys/devices/..., and the components of that link
+ * ARE the device's parentage, all the way up. An i2c-expander-backed gpiochip therefore has an
+ * `i2c-<n>` component in its path (the adapter), typically followed by an `<n>-00xx` client; an
+ * MMIO system-controller block, which is what this board actually has, has none. Reading the
+ * link is one syscall and needs no realpath, no /sys/bus/gpio (which 4.14 may not have) and no
+ * assumption about how deep the expander sits.
+ *
+ * IT REQUIRES THE SYSFS HALF TO HAVE RESOLVED. If only the chardev found the chip there is no
+ * class directory to walk, and the answer is UNKNOWN -- which dp_sff_xchk_independent() treats
+ * as NOT independent. Fail closed: a pin that stays single-transport is what it was yesterday;
+ * a cross-check that cannot fail is worse than none.
+ */
+static int sff_gpiochip_i2c_adapter(const char *chipdir)
+{
+	char path[96], link[512];
+	const char *c;
+	ssize_t n;
+
+	if (!chipdir || !chipdir[0])
+		return DP_SFF_I2C_ADAPTER_UNKNOWN;
+	snprintf(path, sizeof(path), "/sys/class/gpio/%s", chipdir);
+	n = readlink(path, link, sizeof(link) - 1);
+	if (n <= 0)
+		return DP_SFF_I2C_ADAPTER_UNKNOWN;
+	if ((size_t)n >= sizeof(link) - 1)
+		return DP_SFF_I2C_ADAPTER_UNKNOWN;	/* truncated == parentage not seen */
+	link[n] = '\0';
+
+	for (c = link; *c != '\0'; ) {
+		if (strncmp(c, "i2c-", 4) == 0 && c[4] >= '0' && c[4] <= '9') {
+			int adapter = 0;
+			const char *d = c + 4;
+
+			while (*d >= '0' && *d <= '9') {
+				adapter = adapter * 10 + (*d - '0');
+				d++;
+				if (adapter > 65535)
+					return DP_SFF_I2C_ADAPTER_UNKNOWN;
+			}
+			/* Only a WHOLE path component counts. "i2c-2" is an adapter;
+			 * "i2c-2xyz" is some other device whose name happens to start that
+			 * way, and treating it as one would be a guess. */
+			if (*d == '/' || *d == '\0')
+				return adapter;
+		}
+		while (*c != '\0' && *c != '/')
+			c++;
+		while (*c == '/')
+			c++;
+	}
+	return DP_SFF_I2C_ADAPTER_NONE;
+}
+
+static void sff_xchk_gather(const struct dp_sff_cage *cage, struct dp_sff_xsrc *src)
+{
+	const struct sff_chip *chip;
+	uint8_t a0[2];
+	int bank = -1;
+	uint8_t i;
+
+	src->gpio_i2c_adapter = DP_SFF_I2C_ADAPTER_UNKNOWN;
+	src->a0_ok = 0;
+	src->a0_dmt = 0;
+	src->a0_enh = 0;
+	src->a2_ok = 0;
+	src->a2_status = 0;
+
+	/* THE BANK THE CROSS-CHECKABLE PINS LIVE ON. Independence is a property of the GPIO
+	 * CONTROLLER those pins were read through, so it must be that controller that is walked.
+	 * If the cross-checkable pins are spread across two banks this cannot be answered with a
+	 * single adapter number, and the honest reply is UNKNOWN -- which fails closed. */
+	for (i = 0; i < cage->npins; i++) {
+		if (!cage->pins[i].phase_a_read)
+			continue;
+		if (!(cage->pins[i].bit & DP_SFF_XCHK_PINS))
+			continue;
+		if (bank < 0)
+			bank = (int)cage->pins[i].bank;
+		else if (bank != (int)cage->pins[i].bank)
+			return;			/* two banks, one answer: refuse */
+	}
+	if (bank < 0)
+		return;
+
+	chip = sff_chip_for_bank((uint8_t)bank);
+	if (!chip)
+		return;
+	src->gpio_i2c_adapter = sff_gpiochip_i2c_adapter(chip->dir);
+
+	/* A0h bytes 92-93 in one transaction: Diagnostic Monitoring Type and Enhanced Options.
+	 * They say whether an A2 page exists at all and which of byte 110's bits the module
+	 * actually maintains -- so they are read FIRST and A2 is not trusted without them. */
+	if (sff_i2c_read(cage->i2c_bus, cage->i2c_a0, SFF8472_A0_DMT, a0, 2) == 0) {
+		src->a0_ok = 1;
+		src->a0_dmt = a0[0];
+		src->a0_enh = a0[1];
+	}
+	if (sff_i2c_read(cage->i2c_bus, cage->i2c_a2, SFF8472_A2_STATUS, &src->a2_status, 1) == 0)
+		src->a2_ok = 1;
+	else
+		src->a2_status = 0;	/* consulted only under a2_ok; zeroed so a future reader
+					 * cannot pick up a stale byte and call it a reading */
 }
 
 #else	/* !__linux__ */
@@ -489,6 +813,28 @@ static int sff_read_line(const struct sff_chip *chip, uint8_t line, uint8_t driv
 {
 	(void)chip; (void)line; (void)driven; (void)out;
 	return -1;
+}
+
+/*
+ * NOT LINUX -- no i2c adapter and no sysfs parentage to walk, so nothing can be corroborated.
+ * The honest answer is the SAME one the appliance gives when the bus does not answer: UNKNOWN
+ * parentage and no bytes, which dp_sff_xchk_classify() lands in the THIRD state. It is not an
+ * error and it does not clear anybody's `valid` bit.
+ *
+ * Note what this costs, because it is the project's known cfg-split hazard and it applies here
+ * exactly as it does to the GPIO half above: the Linux transport is never compiled on this
+ * host. The CLASSIFIER is, and that is where every decision lives -- but the i2c transaction
+ * and the parentage walk must be compiled on a Linux box before they are believed.
+ */
+static void sff_xchk_gather(const struct dp_sff_cage *cage, struct dp_sff_xsrc *src)
+{
+	(void)cage;
+	src->gpio_i2c_adapter = DP_SFF_I2C_ADAPTER_UNKNOWN;
+	src->a0_ok = 0;
+	src->a0_dmt = 0;
+	src->a0_enh = 0;
+	src->a2_ok = 0;
+	src->a2_status = 0;
 }
 
 #endif	/* __linux__ */
@@ -557,6 +903,13 @@ void dp_sff_test_set_chip_label(const char *label)
 	sff_label_override = label;
 	sff_chip_forget();	/* a cached resolution belongs to the OLD label */
 }
+
+static const struct dp_sff_xsrc *sff_xsrc_override;
+
+void dp_sff_test_set_xsrc(const struct dp_sff_xsrc *src)
+{
+	sff_xsrc_override = src;
+}
 #endif
 
 uint8_t dp_sff_read_pins(const struct dp_sff_cage *cage, uint8_t *raw, uint8_t *ok)
@@ -566,6 +919,33 @@ uint8_t dp_sff_read_pins(const struct dp_sff_cage *cage, uint8_t *raw, uint8_t *
 		return sff_read_hook(cage, raw, ok);
 #endif
 	return sff_read_pins_real(cage, raw, ok);
+}
+
+/*
+ * THE CROSS-CHECK'S ONE PUBLIC ENTRY, and the seam is placed the same way dp_sff_read_pins()'s
+ * is: the TRANSPORT is what a test may displace, never the classifier. So a suite that
+ * constructs an i2c-expander board still runs the shipping three-state logic, and there is no
+ * way to write a call that bypasses it.
+ */
+void dp_sff_cross_check(const struct dp_sff_cage *cage, uint8_t logical, uint8_t want,
+			struct dp_sff_xchk *out)
+{
+	struct dp_sff_xsrc src;
+
+	out->agreed = 0;
+	out->disagreed = 0;
+	out->nocheck = (uint8_t)(want & DP_SFF_XCHK_PINS);
+	if (!cage || !out->nocheck)
+		return;			/* nothing asked: no bus transaction, no verdict */
+
+#ifdef DP_SWOP_TEST
+	if (sff_xsrc_override) {
+		dp_sff_xchk_classify(sff_xsrc_override, (int)cage->i2c_bus, logical, want, out);
+		return;
+	}
+#endif
+	sff_xchk_gather(cage, &src);
+	dp_sff_xchk_classify(&src, (int)cage->i2c_bus, logical, want, out);
 }
 
 #endif /* DP_SFF_C */

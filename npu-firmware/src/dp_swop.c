@@ -393,6 +393,7 @@ int dp_swop_service(const void *req_buf, unsigned req_len, void *resp_buf, unsig
 
 	case DP_SWOP_OP_SFP: {
 		const struct dp_sff_cage *cage;
+		struct dp_sff_xchk xchk;
 		uint8_t raw = 0, ok = 0;
 		uint8_t implemented = 0, active_low = 0, valid = 0, logical = 0;
 
@@ -492,6 +493,32 @@ int dp_swop_service(const void *req_buf, unsigned req_len, void *resp_buf, unsig
 			valid = (uint8_t)(valid & (uint8_t)~(unsigned)(DP_SWOP_SFP_PIN_RX_LOS |
 								      DP_SWOP_SFP_PIN_TX_FAULT |
 								      DP_SWOP_SFP_PIN_TX_DISABLE));
+
+		/* THE A2 CROSS-CHECK. Nothing above this line establishes that the cage pads are
+		 * actually in GPIO FUNCTION, and on a pad whose function has not been established
+		 * NEITHER LEVEL IS EVIDENCE -- a pad held in a peripheral function reads LOW, and
+		 * an open-drain i2c pad idling on its pull-up reads HIGH, which is exactly what an
+		 * asserted TX_DISABLE looks like. Two of these four pins are readable a SECOND way,
+		 * over a different controller, from the module itself (SFF-8472 A2h byte 110), and
+		 * a disagreement between the two is the muxed-or-dead-pad signature.
+		 *
+		 * A DISAGREEING PIN HAS NOT BEEN VALIDLY MEASURED, so its `valid` bit clears while
+		 * `implemented` stays set -- the contract's existing shape for wired-but-unmeasured,
+		 * which the host already renders distinctly from a pin reading 0. NO WINNER IS
+		 * PICKED between the two transports, exactly as the sysfs row one layer up refuses
+		 * a row whose two sides disagree rather than choosing one.
+		 *
+		 * ORDER: AFTER the (b) clamp, deliberately. An empty cage has already dropped
+		 * rx_los and tx_disable from `valid`, so `want` is then empty and the bus is not
+		 * touched at all -- there is no module to answer, and asking would only produce a
+		 * failure that has to be reasoned about.
+		 *
+		 * THREE STATES, and only one of them changes anything here. `agreed` and `nocheck`
+		 * (no module diagnostics, a bus that did not answer, or a gpiochip that shares an
+		 * adapter with the EEPROM and is therefore not a second transport) both leave
+		 * `valid` exactly as it was. An i2c failure is NOT a disagreement. */
+		dp_sff_cross_check(cage, logical, (uint8_t)(valid & DP_SFF_XCHK_PINS), &xchk);
+		valid = (uint8_t)(valid & (uint8_t)~(unsigned)xchk.disagreed);
 
 		resp.sfp.valid = valid;
 		resp.sfp.logical = logical;
