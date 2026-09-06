@@ -14,7 +14,7 @@ cp /w/dp-src/tag_dsa.h /w/dp-src/pport_hdr.h /w/dp-src/portmap.h /w/dp-src/dp_co
 # D84: the switch-register handler. forwarder.c includes dp_swop.c as a single TU (see the
 # comment there), so BOTH files must be in the include path or the build fails loudly at
 # the #include -- it cannot silently produce a dp_fwd without the handler.
-cp /w/dp-src/dp_swop.h /w/dp-src/dp_swop.c $MUSDK/apps/include/
+cp /w/dp-src/dp_swop.h /w/dp-src/dp_swop.c /w/dp-src/dp_sff.h /w/dp-src/dp_sff.c $MUSDK/apps/include/
 cd $MUSDK
 echo "=== make (incremental: rebuild pkt_echo w/ framing) ==="
 make 2>&1 | grep -viE "^make\[|Nothing to be done|Entering|Leaving" | tail -30

@@ -62,7 +62,9 @@ Rules for `forwarder.c`:
 - Because it is compiled into a binary you may ship (`dp_fwd`), it is committed here as source.
   Distributing `dp_fwd` obliges you to make the corresponding source available (GPL-2.0 §3).
 
-`npu-firmware/src/dp_swop.c` is MIT and is `#include`d at `forwarder.c:116`: the MUSDK app makefile
+`npu-firmware/src/dp_swop.c` is MIT and is `#include`d at `forwarder.c:116`; it in turn
+`#include`s `npu-firmware/src/dp_sff.c`, which is equally MIT, so BOTH ship inside `dp_fwd`.
+The MUSDK app makefile
 builds exactly one `.c` for the example `dp_fwd` is forked from, so the two files compile as a
 single translation unit. That unit is not the whole binary. `dp_fwd` is built inside the MUSDK tree
 and links MUSDK's app-common objects (`mvapp`, `cli`, `pp2_utils`, `giu_utils`, `nmp_guest_utils`)

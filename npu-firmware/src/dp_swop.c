@@ -16,6 +16,12 @@
 
 #include "dp_swop.h"
 
+/* The board's SFP cage descriptor and its sideband GPIO reads. A cage is reached over a
+ * completely different bus from this file's SMI, so it lives in its own pair — but it is
+ * #included at the FOOT of this file, not compiled separately, because forwarder.c compiles
+ * THIS file as a single translation unit (build_fwd.sh:14-17, docs/LICENSING.md). */
+#include "dp_sff.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
@@ -385,6 +391,117 @@ int dp_swop_service(const void *req_buf, unsigned req_len, void *resp_buf, unsig
 		break;
 	}
 
+	case DP_SWOP_OP_SFP: {
+		const struct dp_sff_cage *cage;
+		uint8_t raw = 0, ok = 0;
+		uint8_t implemented = 0, active_low = 0, valid = 0, logical = 0;
+
+		/* IDENTITY FIRST, AND ON EVERY PATH INCLUDING THE ERROR ONES. These four fields
+		 * ARE the echo defence, not decoration: they sit at offsets 12..17, past the end
+		 * of the TWELVE-byte request, so a pre-D84 NPU echoing the request verbatim has
+		 * no byte to supply them with and the host's verdict lands on NOMARK instead of
+		 * on the manufactured OK that the PORTS echo produced. The wire contract requires
+		 * mark/port/page/cage_map on E_NOCAGE and E_PAGE too, which is why they are
+		 * written before the first refusal rather than on the success path. */
+		resp.sfp.port = req.dev;
+		resp.sfp.page = req.reg;
+		resp.sfp.mark = DP_SWOP_SFP_MARK;
+		resp.sfp.cage_map = dp_sff_cage_map();
+		/* resp.count is left 0 DELIBERATELY. It is one of the two fields the old echo
+		 * aliased onto (resp.count <- req.reg), so OP_SFP gives it no job at all: nothing
+		 * in the host verdict reads it, and any later use of it has to survive the echo
+		 * analysis again rather than inherit a pass. */
+
+		/* ORDER: request VALIDITY, then request SUPPORT, then BOARD fact. The same
+		 * discipline OP_WRITE follows, for the same reason -- "0x1b is not a port
+		 * device", "phase-A firmware cannot serve page A0" and "port 3 has no cage" are
+		 * three different answers, and a caller debugging a refusal needs to know which.
+		 *
+		 * THE LEGAL SET HERE IS NARROWER THAN dev_is_legal()'s, on purpose. Global1 and
+		 * Global2 are real, readable devices, but they are not PORTS and cannot own a
+		 * front-panel cage; the contract says a dev outside 0x00..0x0a answers E_DEV.
+		 * Calling dev_is_legal() would have let 0x1b through to E_NOCAGE -- a board fact
+		 * about a device that has no front panel to have a cage on. */
+		if (req.dev > DP_SWOP_PORT_DEV_MAX) {
+			resp.status = DP_SWOP_E_DEV;
+			break;
+		}
+		if (req.reg != DP_SWOP_SFP_PAGE_PINS) {
+			/* PAGE_A0 and PAGE_A2 land here: phase-A firmware REFUSES the page it
+			 * cannot serve. Never a zero-filled page -- SFF-8472 assigns meanings to
+			 * 0x00, so a zeroed page decodes as a plausible, wrong, MODULE-SHAPED
+			 * answer. That is the absence contract sfp-rate-read.sh pre-registered. */
+			resp.status = DP_SWOP_E_PAGE;
+			break;
+		}
+		/* req.val is the page BYTE OFFSET, and phase A ignores it. Written down because
+		 * "ignored" has to be a decision the code shows rather than an omission a reader
+		 * has to infer -- and because phase B is where it starts mattering. */
+
+		cage = dp_sff_cage_for_dev(req.dev);
+		if (!cage) {
+			/* ABSENCE CASE (a). implemented and valid stay 0 -- but for a DIFFERENT
+			 * reason than in case (b), and the status is what carries the difference. */
+			resp.status = DP_SWOP_E_NOCAGE;
+			break;
+		}
+
+		implemented = dp_sff_implemented(cage);
+		active_low = dp_sff_active_low(cage);
+		resp.sfp.implemented = implemented;
+		resp.sfp.active_low = active_low;
+
+		st = dp_sff_read_pins(cage, &raw, &ok);
+		if (st != DP_SWOP_OK) {
+			/* The controller itself could not be resolved BY LABEL. `implemented`
+			 * stays SET -- the board still wires those pins -- while valid, raw and
+			 * logical stay 0, so the reply says "these four exist and I measured none
+			 * of them" rather than shipping four zeros that decode as a seated,
+			 * silent, perfectly healthy module. */
+			resp.status = st;
+			break;
+		}
+
+		/* A pin this firmware does not offer as a measurement may not be reported. */
+		ok = (uint8_t)(ok & implemented);
+		if (!ok) {
+			/* The chip resolved but NOT ONE line could be read. This is the same
+			 * discipline npu_switch_ports follows when it refuses to render an
+			 * all-zero table: a silently-failed scan and a genuinely quiet board
+			 * read identically, so a scan that read nothing must not report
+			 * success. Louder than an OK carrying valid = 0, and no less true. */
+			resp.status = DP_SWOP_E_GPIO;
+			break;
+		}
+		raw = (uint8_t)(raw & ok);
+		logical = (uint8_t)((raw ^ active_low) & ok);
+		valid = ok;
+
+		/* ABSENCE CASE (b) -- a cage with nothing seated. rx_los, tx_fault and tx_disable
+		 * are pins of a MODULE, and with no module the level the board floats to is not a
+		 * measurement of light; reporting it as a zero reading is exactly the
+		 * manufactured zero this opcode exists to prevent. Their `valid` bits clear while
+		 * `implemented` stays set, and that is what distinguishes (b) from (c).
+		 *
+		 * THE SAME APPLIES WHEN PRESENT ITSELF DID NOT READ. An rx_los level that cannot
+		 * be attributed to a seated module is not attributable at all, so "we could not
+		 * tell" is folded in here rather than being allowed to fall through to the
+		 * seated case by default. */
+		if (!(valid & DP_SWOP_SFP_PIN_PRESENT) ||
+		    !(logical & DP_SWOP_SFP_PIN_PRESENT))
+			valid = (uint8_t)(valid & (uint8_t)~(unsigned)(DP_SWOP_SFP_PIN_RX_LOS |
+								      DP_SWOP_SFP_PIN_TX_FAULT |
+								      DP_SWOP_SFP_PIN_TX_DISABLE));
+
+		resp.sfp.valid = valid;
+		resp.sfp.logical = logical;
+		resp.sfp.raw = raw;
+		/* page_off and page_len stay 0: phase A carries no page bytes, and an EMPTY RANGE
+		 * is not a zero READING. data[] stays zeroed by the memset at the top. */
+		resp.status = DP_SWOP_OK;
+		break;
+	}
+
 	default:
 		resp.status = DP_SWOP_E_OP;
 		break;
@@ -395,3 +512,15 @@ out:
 	memcpy(resp_buf, &resp, out_len);
 	return (int)out_len;
 }
+
+/*
+ * SINGLE TRANSLATION UNIT, matching the arrangement one layer up: forwarder.c #includes THIS
+ * file (build_fwd.sh:14-17, docs/LICENSING.md), so the SFP/GPIO half is #included HERE rather
+ * than compiled and linked separately. dp_fwd therefore gains no object file and no link step,
+ * and dp_swop_test.c's existing command line -- two .c files -- keeps working unchanged.
+ *
+ * It is at the FOOT so this file reads as itself first; only dp_sff.h's declarations are needed
+ * above, and everything dp_sff.c exposes is prefixed dp_sff_/sff_ so nothing collides in the
+ * merged unit.
+ */
+#include "dp_sff.c"
