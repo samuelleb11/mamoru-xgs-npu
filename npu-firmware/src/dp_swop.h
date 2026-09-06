@@ -122,6 +122,10 @@
 #define DP_SWOP_OP_READ		0x01u	/* one register                              */
 #define DP_SWOP_OP_WRITE	0x02u	/* one register                              */
 #define DP_SWOP_OP_PORTS	0x03u	/* bulk: status+vlanmap for every port dev   */
+#define DP_SWOP_OP_SFP		0x04u	/* per-port SFP cage sideband — see below    */
+/* 0x04 was confirmed FREE on BOTH sides before it was claimed: the opcode namespace held only
+ * 0x01/0x02/0x03 here and in the host's agnic_swop.h. (0x04 is also E_REG, but that is the
+ * STATUS namespace; the two never share a field.) */
 
 /* Status codes. 0 is the ONLY success value. */
 #define DP_SWOP_OK		0x00u
@@ -138,6 +142,46 @@
 #define DP_SWOP_W_NOCHANGE	0x0bu	/* read-back agrees, but NOTHING CHANGED —
 					 * the write is UNVERIFIABLE, see below      */
 
+/* 0x0c..0x0e belong to OP_SFP. They are non-zero — status != OK — because the ABSENCE CONTRACT
+ * this opcode inherits forbids answering an unanswerable question with a zero: SFF-8472 gives
+ * 0x00 a meaning ("rate not specified"), so a zero from a bus that was never there decodes as a
+ * plausible, wrong, MODULE-SHAPED answer. Each of these says WHICH question could not be
+ * answered instead.
+ *
+ * E_NOCAGE IS AN ANSWER, NOT A FAULT. "port 3 has no SFP cage" is a true, useful board fact; it
+ * is carried as a status only because status is the field that cannot be mistaken for a reading.
+ * The handler MUST still fill port/page/mark/cage_map on this path — see struct dp_swop_sfp. */
+#define DP_SWOP_E_NOCAGE	0x0cu	/* the addressed port device has no SFP cage on this
+					 * board — distinct from an EMPTY cage       */
+#define DP_SWOP_E_PAGE		0x0du	/* unknown/unsupported page selector. THIS is what
+					 * phase-A firmware answers to a phase-B A0/A2
+					 * request — never a zero-filled page, which
+					 * would decode as a real module             */
+#define DP_SWOP_E_GPIO		0x0eu	/* the cage's GPIO controller could not be resolved
+					 * BY LABEL, or a line read failed outright.
+					 * NEVER a guessed chip base: Linux GPIO bases
+					 * are not stable across kernels and a wrong
+					 * base reads OTHER pins and answers with
+					 * confidence. On this board the descriptor's
+					 * `gpio2` is the chip labelled
+					 * "f2440000.system-controller:gpio@140"
+					 * (measured 2026-09-06: Linux gpiochip64 on
+					 * that boot, ngpio 31 — the LABEL is the key,
+					 * the base is not). A single line that fails
+					 * clears its `valid` bit instead.           */
+
+/* THE CEILING, and it did not exist on this side until OP_SFP added to it.
+ *
+ * The host has carried AGNIC_SWOP_STATUS_MAX from the beginning and its drift test pins that
+ * every value up to it has a NAME. This side had no twin — which is precisely how 0x09..0x0b
+ * were added here and went unnamed on the host for weeks: the repo that GROWS the vocabulary was
+ * the one with nothing declaring how far it had grown. A ceiling only the consumer holds is a
+ * ceiling the producer can walk past without noticing.
+ *
+ * BUMP THIS IN THE SAME COMMIT as any new status code, and bump the host's twin in the same
+ * breath. scripts/swop-contract-diff.sh in the host repo compares the two by value. */
+#define DP_SWOP_STATUS_MAX	0x0eu
+
 #define DP_SWOP_PORT_DEV_MAX	0x0au	/* port devices are 0x00..0x0a               */
 #define DP_SWOP_DEV_GLOBAL1	0x1bu
 #define DP_SWOP_DEV_GLOBAL2	0x1cu
@@ -147,6 +191,149 @@
 #define DP_SWOP_REG_STATUS	0x00u	/* Port Status: link(11) duplex(10) speed(9:8) */
 #define DP_SWOP_REG_SWITCH_ID	0x03u	/* reads 0x1930 at ANY device — never a probe  */
 #define DP_SWOP_REG_VLAN_MAP	0x06u	/* Port-Based VLAN Map — what D84 writes       */
+
+/* ---- OP_SFP: the per-port SFP cage sideband (phase A) --------------------------------------
+ *
+ * WHAT IT IS FOR, in one sentence: on 2026-09-06 the appliance's only optical port was dark for
+ * three days and the answer — the far end's laser was off (Nami CS110 lan25: TX -40 dBm, 0.002 mA
+ * bias, hardware TX_DISABLE asserted) — was two bytes of sideband this board already had wired
+ * and nothing in our software ever read. `rx_los` says "no light is arriving" in one glance.
+ *
+ * PER PORT, NOT PER BOARD. On the XGS 116 exactly one device has a cage — 0x09, front panel F1,
+ * vendor `npu0.eth8` — and it would have been a byte cheaper to define this opcode as "tell me
+ * about THE cage". That is a board fact leaking into a wire format. Other boards in this family
+ * carry several cages and the fabric direction adds Nami switches with four, so the request names
+ * a PORT DEVICE (0x00..0x0a, the same address space every other swop op uses) and the reply
+ * describes THAT cage. `cage_map` below tells a caller which iterations are worth making, in one
+ * round trip, so the generality costs no extra traffic.
+ *
+ * THE REQUEST reuses `struct dp_swop_req` unchanged — no new request type, no layout churn:
+ *   op   = DP_SWOP_OP_SFP
+ *   dev  = the port device whose cage is being asked about, 0x00..0x0a. Outside that set the
+ *          handler answers DP_SWOP_E_DEV, exactly as READ and WRITE do; OP_SFP invents no second
+ *          addressing style.
+ *   reg  = the PAGE SELECTOR (DP_SWOP_SFP_PAGE_*). Phase A sends PAGE_PINS.
+ *   val  = byte offset within that page. Phase A sends 0 and the handler ignores it.
+ *
+ * HOW PHASE B FITS WITHOUT A FIFTH OPCODE OR A WIRE BREAK — requirement, not aspiration.
+ * The A0 (SFF-8431 identity, i2c 0x50) and A2 (SFF-8472 diagnostics, i2c 0x51) pages are 128
+ * bytes each and the whole response payload is 44, so a page cannot be one reply however it is
+ * laid out. The selector + offset already in the request, and page_off/page_len/data[] already in
+ * the reply, make phase B a matter of this handler answering PAGE_A0/PAGE_A2 instead of refusing
+ * them with DP_SWOP_E_PAGE. Nothing on the wire moves and no constant changes value.
+ *
+ * AND THE PARSE THAT COST THIS PROJECT WEEKS IS NOT REPEATED HERE. The descriptor says
+ * `npu0.phy8.SFF-8431=i2c1:2:0x50`, and the vendor library parses it with the literal format
+ * "i2c1:%i:%i" — `i2c1` is a FIXED PREFIX TOKEN and the FIRST number is the BUS. The cage is
+ * /dev/i2c-2 address 0x50, WITH NO MUX (measured 2026-09-06: i2c-0 and i2c-2 exist, i2c-1 is
+ * `status="disabled"` in the DTB, both 0x50 and 0x51 answer on bus 2, and there is no mux at
+ * 0x70-0x77). This contract carries NO bus or address field ON PURPOSE: the descriptor lives on
+ * THIS side and so does its parsing, and a bus number on the wire is one more place to re-make
+ * that mistake.
+ *
+ * WHAT THE HANDLER MUST FILL, AND WHICH FIELD IS WHICH. Written down because a normalisation
+ * whose direction is not written down is how a polarity bug survives review:
+ *
+ *   raw          the ELECTRICAL level read at the GPIO line, before any inversion.
+ *   active_low   which bits THIS BOARD's descriptor marks active low. `present` is `-gpio:2:22`
+ *                — the leading minus IS the polarity — so on the XGS 116 this is exactly
+ *                DP_SWOP_SFP_ACTIVE_LOW_XGS116. Sent because the descriptor lives here; the host
+ *                must never hold board polarity of its own.
+ *   logical      the NORMALISED, ACTIVE-HIGH value: 1 means the condition named by the bit is
+ *                TRUE. logical == raw ^ active_low, for every bit, and the host RE-DERIVES that
+ *                identity on every read (agnic_swop_sfp_fault). Getting it wrong is caught by
+ *                the consumer, not by an operator wondering why an empty cage reports a module.
+ *   implemented  the BOARD wires this pin. Static, from the descriptor.
+ *   valid        THIS REPLY's `logical` bit is a measurement. MUST be a subset of implemented.
+ *
+ * THE FOUR ABSENCE CASES, ALL DISTINGUISHABLE, NONE OF THEM A BARE ZERO — the same rule
+ * sfp-rate-read.sh pre-registered for the EEPROM and dp_swop's own PORTS table follows:
+ *
+ *   (a) this port has no cage at all       status = E_NOCAGE; implemented = 0, valid = 0; still
+ *                                          fill port/page/mark/cage_map.
+ *   (b) cage present, nothing seated       status = OK; implemented = the wired set (0x0f on this
+ *                                          board); valid = PIN_PRESENT ONLY; logical's PRESENT
+ *                                          bit = 0. DO NOT set valid for rx_los/tx_fault/
+ *                                          tx_disable here — a floating line is not a
+ *                                          measurement of light, and reporting it as a zero
+ *                                          reading is the manufactured-zero this opcode exists
+ *                                          to avoid.
+ *   (c) pin not wired on this board        implemented bit CLEAR (and therefore valid clear).
+ *   (d) pin wired, and it reads 0          implemented SET, valid SET, logical bit 0.
+ *
+ * GPIO RESOLUTION IS BY LABEL, AND IT FAILS LOUDLY. Measured 2026-09-06: the booted DTB maps the
+ * descriptor's `gpio2` to /cp0/config-space/system-controller@440000/gpio@140, status="okay",
+ * ngpios 31 — i.e. the chip whose sysfs label is "f2440000.system-controller:gpio@140", which was
+ * Linux gpiochip64 ON THAT BOOT. **Do not hardcode base 64.** Linux GPIO bases are not stable
+ * across kernels, nothing is exported, there are no gpio-line-names and debugfs is not mounted,
+ * so a guessed base reads OTHER pins and answers with total confidence. Resolve the chip by
+ * label; if the label is absent, answer DP_SWOP_E_GPIO. Never fall back.
+ *
+ * THE ECHO DEFENCE — the single most important property of this layout.
+ *
+ * A pre-D84 NPU echoes the request back VERBATIM. When the magics were the same, that echo passed
+ * every host check and the fields ALIASED: resp.status landed on req.dev and resp.count on
+ * req.reg, so the PORTS call (dev=0, reg=0) read back as status=0=OK and firmware WITHOUT the
+ * handler was reported as SUCCESS. OP_SFP is answerable by an echo in NEITHER of the two ways
+ * that bug needed, and the reasons are structural rather than lucky:
+ *
+ *  1. The magics still differ ("SWOR" vs "SWOP"), so a verbatim echo is refused at byte 0.
+ *  2. THE ALIAS IS DESIGNED OUT. Every field the host's verdict depends on — `port`, `page`,
+ *     `mark` — lives at offset 12 or beyond, and `struct dp_swop_req` is TWELVE BYTES. An echo
+ *     physically cannot supply them: there is no request byte at those offsets to echo. The host
+ *     zeroes its 56-byte response buffer before the send, so an echoing peer leaves 12..55 as
+ *     ZERO, and `mark` is required to be DP_SWOP_SFP_MARK, a fixed non-zero constant. The verdict
+ *     is ECHO or NOMARK, deterministically, never OK.
+ *  3. The two fields the old bug aliased ONTO are deliberately NOT load-bearing: `count` is
+ *     consulted by nothing in the host's SFP verdict, and `status` only AFTER `mark` and `port`
+ *     have attributed the reply — so even dev=0, exactly what aliased to status=0=OK for PORTS,
+ *     cannot reach a success verdict.
+ *  4. And the send is gated on DP_SWOP_CAP_SFP, so firmware predating this opcode is never sent
+ *     one. That matters beyond correctness: an unanswered custom send strands the management
+ *     channel and the only recovery is a mains cycle (DEBT #80). The capability gate is the
+ *     primary defence; 1-3 are what stands if it is ever wrong.
+ */
+#define DP_SWOP_SFP_MARK	0x5346u	/* "SF". Fixed, NON-ZERO, at reply offset 14 — past the
+					 * end of the 12-byte request, so no echo can produce
+					 * it. Fill it on EVERY OP_SFP reply, errors included. */
+
+/* Page selectors, carried in req.reg. PAGE_PINS is 0x01 and NOT 0x00 on purpose: a zero selector
+ * would make "the default request" and "an uninitialised buffer" the same bytes. 0xa0/0xa2 are
+ * the classic 8-bit forms of i2c addresses 0x50/0x51, so the selector names the page an SFF
+ * datasheet names rather than inventing a third numbering. */
+#define DP_SWOP_SFP_PAGE_PINS	0x01u	/* phase A: sideband pins only              */
+#define DP_SWOP_SFP_PAGE_A0	0xa0u	/* phase B: SFF-8431 identity   (i2c 0x50)  */
+#define DP_SWOP_SFP_PAGE_A2	0xa2u	/* phase B: SFF-8472 diagnostics (i2c 0x51) */
+#define DP_SWOP_SFP_PAGE_LEN	0x80u	/* 128 bytes; both pages, per SFF-8472      */
+#define DP_SWOP_SFP_CHUNK	0x1cu	/* 28 bytes of page per reply — what is left of the
+					 * 44-byte payload after the fixed fields. A page is
+					 * 5 replies; page_off/page_len say which bytes
+					 * arrived, so a caller never assumes a stride.     */
+
+/* Sideband pin bits. One numbering shared by implemented/valid/logical/raw/active_low, so a mask
+ * can be compared against a value with no translation step — a constant mirrored into a second
+ * convention is how a copied constant goes wrong silently. */
+#define DP_SWOP_SFP_PIN_PRESENT		0x01u	/* module seated. ACTIVE LOW on the wire */
+#define DP_SWOP_SFP_PIN_RX_LOS		0x02u	/* 1 = loss of received light            */
+#define DP_SWOP_SFP_PIN_TX_FAULT	0x04u	/* 1 = transmitter fault                 */
+#define DP_SWOP_SFP_PIN_TX_DISABLE	0x08u	/* 1 = laser commanded off               */
+/* Reserved bit positions for the two RATE SELECT lines. Phase A DRIVES rate_select_0/1 during
+ * bring-up (gpio:2:23 and gpio:2:29) but does not READ them back, so phase-A firmware MUST leave
+ * these clear in `implemented` — claiming a pin is implemented while reporting a value nobody
+ * read is case (d) wearing case (c)'s clothes, which is the exact confusion this contract exists
+ * to prevent. Numbered here so adding the readback later is a firmware change, not a wire one. */
+#define DP_SWOP_SFP_PIN_RS0		0x10u
+#define DP_SWOP_SFP_PIN_RS1		0x20u
+#define DP_SWOP_SFP_PINS_PHASE_A	0x0fu	/* the four bits phase A may ever set */
+
+/* KNOWN-VALUE POSITIVE CONTROLS for the XGS 116, in the spirit of DP_SWOP_REG_SWITCH_ID: a
+ * plausible reply can be checked against them instead of trusted. They are NOT the source of
+ * truth and NOTHING MAY BRANCH ON THEM — this handler derives cage_map and active_low from the
+ * board descriptor, because a value hardcoded to this board is wrong on the very next one.
+ * Ground truth, AMDA0208-0001R00.txt:163-171: one cage, on device 0x09; `present` is
+ * `-gpio:2:22`, the only pin carrying the leading minus. */
+#define DP_SWOP_SFP_CAGE_MAP_XGS116	0x0200u	/* bit 9 only == PortF1 */
+#define DP_SWOP_SFP_ACTIVE_LOW_XGS116	0x01u	/* PRESENT only         */
 
 struct dp_swop_req {
 	uint32_t	magic;		/* DP_SWOP_MAGIC                     */
@@ -163,6 +350,46 @@ struct dp_swop_port {
 	uint16_t	vlan_map;	/* reg 6 */
 };					/* 4 bytes */
 
+/*
+ * The OP_SFP payload. Occupies the SAME 44 bytes as ports[] — the response is 56 bytes and it is
+ * FULL, fixed by the AGNIC ABI's AGNIC_MGMT_DESC_DATA_LEN, so there is nowhere else for it to
+ * live and growing the struct is not on the table.
+ *
+ * EVERY FIELD HERE IS AT OFFSET >= 12, and that is the echo defence, not a coincidence of
+ * layout. See the OP_SFP block above, point 2.
+ */
+struct dp_swop_sfp {
+	uint8_t		port;		/* +12 echo of req.dev — the cage this reply
+					 *     describes. The anti-alias check: a
+					 *     12-byte request has no byte here.     */
+	uint8_t		page;		/* +13 echo of req.reg — DP_SWOP_SFP_PAGE_* */
+	uint16_t	mark;		/* +14 DP_SWOP_SFP_MARK, always, INCLUDING
+					 *     on E_NOCAGE and E_PAGE               */
+	uint16_t	cage_map;	/* +16 bit N set => port device N has a cage
+					 *     on this board. Sent on EVERY reply so
+					 *     one round trip tells a caller which
+					 *     ports are worth asking about.        */
+	uint8_t		implemented;	/* +18 DP_SWOP_SFP_PIN_* the BOARD wires    */
+	uint8_t		valid;		/* +19 ...of which THIS reply measured. MUST
+					 *     be a subset of implemented; the host
+					 *     rejects a reply where it is not.     */
+	uint8_t		logical;	/* +20 NORMALISED, active-high: 1 == the
+					 *     named condition is TRUE.
+					 *     logical == raw ^ active_low          */
+	uint8_t		raw;		/* +21 RAW level, before normalisation      */
+	uint8_t		active_low;	/* +22 which bits the descriptor inverts    */
+	uint8_t		page_off;	/* +23 phase B: byte offset of data[] within
+					 *     the page. 0 in phase A. A page is
+					 *     128 B so a byte suffices; a wider page
+					 *     is a shape change and bumps VERSION.  */
+	uint8_t		page_len;	/* +24 phase B: bytes valid in data[]. 0 in
+					 *     phase A — honest, because these two
+					 *     describe a RANGE, and an empty range
+					 *     is not a zero READING.               */
+	uint8_t		rsv[3];		/* +25 must be 0; phase-B flags land here   */
+	uint8_t		data[DP_SWOP_SFP_CHUNK];	/* +28..+55 page bytes; 0 in phase A */
+};					/* 44 bytes                                 */
+
 struct dp_swop_resp {
 	uint32_t	magic;		/* DP_SWOP_RESP_MAGIC, never the
 					 * request magic — see above         */
@@ -173,7 +400,21 @@ struct dp_swop_resp {
 	uint8_t		count;		/* PORTS: entries valid in ports[]   */
 	uint16_t	val;		/* READ result                       */
 	uint16_t	rsv;
-	struct dp_swop_port ports[DP_SWOP_PORT_COUNT];	/* PORTS only, 44 B  */
+	/*
+	 * ANONYMOUS on purpose. `resp.ports[i]` and `resp.sfp.logical` both stay valid, so
+	 * adding OP_SFP changes NO existing consumer in either repo — a named arm would have
+	 * renamed `ports` at every call site in dp_swop.c, agnic_main.c and agnic_mgmt.c, and
+	 * both trees are shared with concurrent work.
+	 *
+	 * sizeof stays 56 and offsetof(ports) stays 12, so every assert below and every
+	 * BUILD_BUG_ON in the host's agnic_mgmt.c holds unchanged.
+	 *
+	 * `op` says which arm is live. Reading the wrong arm is reading another op's bytes.
+	 */
+	union {
+		struct dp_swop_port ports[DP_SWOP_PORT_COUNT];	/* PORTS, WRITE echo, 44 B */
+		struct dp_swop_sfp  sfp;			/* SFP,                44 B */
+	};
 };					/* 12 + 44 = 56 bytes exactly        */
 
 /* Fail the BUILD, not the wire, if either side's layout drifts. */
@@ -193,6 +434,26 @@ _Static_assert(offsetof(struct dp_swop_resp, status) == 6, "resp.status moved");
 _Static_assert(offsetof(struct dp_swop_resp, count) == 7, "resp.count moved");
 _Static_assert(offsetof(struct dp_swop_resp, val) == 8, "resp.val moved");
 _Static_assert(offsetof(struct dp_swop_resp, ports) == 12, "resp.ports moved");
+/* THE SFP ARM. Its offsets ARE the echo defence — every one of them is >= 12, i.e. past the end
+ * of the 12-byte request, so no echo can supply them. Pinning them here means that property is
+ * enforced by the BUILD rather than re-argued in review each time a field is added. */
+_Static_assert(sizeof(struct dp_swop_sfp) == 44, "sfp payload layout drifted");
+_Static_assert(sizeof(struct dp_swop_sfp) == sizeof(((struct dp_swop_resp *)0)->ports),
+	       "the sfp arm must not grow the response past 56 bytes");
+_Static_assert(DP_SWOP_SFP_CHUNK == 28, "chunk size drifted from the 44-byte payload budget");
+_Static_assert(offsetof(struct dp_swop_resp, sfp) == 12, "resp.sfp moved");
+_Static_assert(offsetof(struct dp_swop_resp, sfp.port) == 12, "sfp.port moved");
+_Static_assert(offsetof(struct dp_swop_resp, sfp.page) == 13, "sfp.page moved");
+_Static_assert(offsetof(struct dp_swop_resp, sfp.mark) == 14, "sfp.mark moved — echo defence");
+_Static_assert(offsetof(struct dp_swop_resp, sfp.cage_map) == 16, "sfp.cage_map moved");
+_Static_assert(offsetof(struct dp_swop_resp, sfp.implemented) == 18, "sfp.implemented moved");
+_Static_assert(offsetof(struct dp_swop_resp, sfp.valid) == 19, "sfp.valid moved");
+_Static_assert(offsetof(struct dp_swop_resp, sfp.logical) == 20, "sfp.logical moved");
+_Static_assert(offsetof(struct dp_swop_resp, sfp.raw) == 21, "sfp.raw moved");
+_Static_assert(offsetof(struct dp_swop_resp, sfp.active_low) == 22, "sfp.active_low moved");
+_Static_assert(offsetof(struct dp_swop_resp, sfp.page_off) == 23, "sfp.page_off moved");
+_Static_assert(offsetof(struct dp_swop_resp, sfp.page_len) == 24, "sfp.page_len moved");
+_Static_assert(offsetof(struct dp_swop_resp, sfp.data) == 28, "sfp.data moved");
 #endif
 
 /* Map the SMI window. Call ONCE at startup. Returns 0, or -errno.
@@ -229,6 +490,41 @@ _Static_assert(offsetof(struct dp_swop_resp, ports) == 12, "resp.ports moved");
 #define DP_SWOP_CAP_SLOT_OFF	0x0000u
 #define DP_SWOP_CAP_MAGIC	0x53574f50u	/* "SWOP" */
 #define DP_SWOP_CAP_VERSION	1u
+
+/* ---- THE FEATURE WORD (third word of the slot) -------------------------------------------
+ *
+ * WHY A THIRD WORD AT ALL. magic+version answer "does this firmware speak swop?". They cannot
+ * answer "does it speak THIS OPCODE?", and that distinction is the whole point of gating OP_SFP:
+ * the host must be able to tell "firmware predates the SFP opcode" from "this port has no cage".
+ * Without it the two collapse into one silence, and the way the host would find out is BY
+ * SENDING — and one unanswered custom send is what stranded the management channel on 2026-09-02
+ * and costs a mains cycle to clear (DEBT #80). The gate has to be readable PASSIVELY.
+ *
+ * WHY THE VERSION IS **NOT** BUMPED FOR IT, which looks like it contradicts the rule above. The
+ * rule is that a change to the SHAPE OF WHAT v1 DEFINES must bump. This is an APPEND: words 0 and
+ * 1 keep their offsets, types and meanings exactly, so a v1 reader reads precisely what it read
+ * before and is not wrong about anything. **STILL BUMP** if any existing word changes meaning, or
+ * if the slot ever shrinks or is reordered — append-only is the entire licence for not bumping.
+ *
+ * WHY THE WORD VALIDATES ITSELF. A v1 firmware publishes 8 bytes and leaves word 2 as whatever
+ * the window already held. The 2026-09-03 survey read that window as exactly 2 non-zero words in
+ * 16384, i.e. zero — but "nothing else writes NW_AGENT" is a should, not a measurement that binds
+ * the future, and a stale non-zero word here would FORGE a capability and buy the wedge this gate
+ * exists to avoid. So the feature word carries its own tag in its high half: the host believes
+ * bits only when (word >> 16) == DP_SWOP_CAP_FEAT_TAG. Zero fails it, all-ones (a PCIe UR read)
+ * fails it, stale traffic fails it with probability 1 - 2^-16.
+ *
+ * PUBLISH ORDER — the magic is the commit point. Write the feature word BEFORE the magic, exactly
+ * as the version already is (forwarder.c: slot[1] then a barrier then slot[0]); the feature word
+ * becomes slot[2] and is written alongside slot[1]. Retract clears the magic first. There is no
+ * torn state in which a reader sees the magic beside a feature word that does not belong to it.
+ * And the publisher's own size refusal must widen from +8 to +DP_SWOP_CAP_SLOT_LEN, or it writes
+ * past the end of a window that is big enough for v1 and not for this.
+ */
+#define DP_SWOP_CAP_FEATURES_OFF	0x0008u	/* within the slot: WINDOW_OFF+SLOT_OFF+8 */
+#define DP_SWOP_CAP_SLOT_LEN		0x000cu	/* magic, version, features */
+#define DP_SWOP_CAP_FEAT_TAG		0x5343u	/* "SC" in the feature word's high half */
+#define DP_SWOP_CAP_SFP			0x00000001u	/* firmware implements DP_SWOP_OP_SFP */
 
 int dp_swop_init(void);
 
