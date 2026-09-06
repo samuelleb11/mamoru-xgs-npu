@@ -1155,20 +1155,95 @@ static void *mng_pump_thread(void *arg)
 
 /* ---- D84 / #24-f: the swop capability carrier ---------------------------------------------
  *
- * Publishes DP_SWOP_CAP_MAGIC + DP_SWOP_CAP_VERSION into the NW_AGENT window of the host-visible
- * BAR0, so the host driver can decide whether this firmware speaks swop WITHOUT sending it a
- * message to find out. See the contract note in dp_swop.h for why the vendor's barmap version
- * could not carry this and why no probe may.
+ * Publishes the THREE-word slot — DP_SWOP_CAP_MAGIC, DP_SWOP_CAP_VERSION, and the tagged FEATURE
+ * word (DP_SWOP_CAP_FEAT_TAG << 16 | DP_SWOP_CAP_SFP) — into the NW_AGENT window of the
+ * host-visible BAR0, so the host driver can decide whether this firmware speaks swop, and which
+ * opcodes it answers, WITHOUT sending it a message to find out. See the contract note in
+ * dp_swop.h for why the vendor's barmap version could not carry this and why no probe may.
  *
- * PUBLISHED ON THE REGISTRATION SUCCESS PATH, NOT AT INIT. The predicate the host's gate needs is
- * not "was this image built with swop source" — it is "is a handler registered right now". A word
- * written at startup, or baked into .rodata, publishes even when the handler was compiled out,
- * failed to register, or registered and was torn down. Writing it where registration succeeds is
- * the only placement whose subject is the thing the gate cares about.
+ * PUBLISHED ON THE REGISTRATION SUCCESS PATH, NOT AT INIT — AND THAT BUYS LESS THAN THIS COMMENT
+ * USED TO CLAIM. It used to say the subject of the advertisement is "a handler registered right
+ * now". It is not, and it cannot be: see WHAT THE CARRIER DOES NOT SAY below. What the placement
+ * does buy is real but narrower — a word written at startup, or baked into .rodata, publishes even
+ * when the handler was compiled out or FAILED to register, and this placement never does. So the
+ * publish is a NECESSARY condition for a live handler, not a sufficient one: it means registration
+ * had succeeded at the instant these words were stored.
+ *
+ * WHAT THE CARRIER DOES NOT SAY — IT IS MEMORY, NOT A LIVENESS SIGNAL. The NW_AGENT window is
+ * host-visible BAR0: it outlives this process. If dp_fwd publishes and then dies — crash, kill,
+ * orderly exit — the magic, version and feature word stand exactly as written, with NO handler
+ * behind them, and the host cannot distinguish that from a healthy box. Nothing in this file can
+ * make it able to. There is no clear on any exit path: MEASURED in this file on 2026-09-06, it has no
+ * atexit, no on_exit and no signal/sigaction call (grep), and deinit_global calls only
+ * apps_pp2_deinit_global; dp_cap_retract's clear runs on no execution (read the note there). Even
+ * if a clear existed, a crash or a SIGKILL would not run it. Detecting a dead publisher needs a
+ * mechanism this carrier does not have — an aged heartbeat word, or the host treating an
+ * unanswered send as a withdrawal, which it cannot afford because the unanswered send is itself
+ * the wedge (DEBT #80). Until such a mechanism exists, "the firmware answered when it published"
+ * is the whole of what a host may conclude.
  *
  * The window is reached through the UIO device MUSDK maps as "pci_ep" region "bar0", discovered
  * from sysfs because the uio index and map index are assigned at bind time. Mapping it here
  * independently of MUSDK's own mapping keeps this out of nmp internals, which are not app-visible.
+ *
+ * THE DOWNGRADE HAZARD — A ROLLED-BACK v1 FORGING CAP_SFP — IS NOW CLOSED, AND NOT BY THIS FILE.
+ * The NW_AGENT window is host-visible BAR0 memory: it outlives a dp_fwd restart and is cleared
+ * only by a MAINS power cycle. Before the feature word existed, the worst thing that could be
+ * sitting at +8 was foreign traffic, which the tag rejects with probability 1 - 2^-16. THIS build
+ * writes a GENUINE tag there. So if this firmware runs, and the box is then rolled back to a v1
+ * dp_fwd — an A/B slot rollback is a designed, expected operation on this product — with no mains
+ * cycle in between, the v1 firmware republishes magic and version, never touches word 2, and our
+ * own real correctly-tagged CAP_SFP is left standing beside firmware that has no OP_SFP handler.
+ * A host matching only magic and version would send OP_SFP, nothing would answer, and one
+ * unanswered custom send strands the management channel: recovery is a mains cycle (DEBT #80, and
+ * it happened on 2026-09-02). Note this makes dp_swop.h's "stale traffic fails it with probability
+ * 1 - 2^-16" true of FOREIGN traffic only, never of our own leftovers.
+ *
+ * WHAT CLOSES IT: DP_SWOP_CAP_VERSION IS 2 (owner ruling, 2026-09-06 — the block in dp_swop.h).
+ * The version is the ONE word a rolled-back v1 publisher rewrites, and the contract requires the
+ * host to match it EXACTLY, never ">=". So the v1 slot republishes version 1, the host refuses the
+ * WHOLE carrier, and our stale feature word goes down with it.
+ *
+ * THE CLOSURE IS CONDITIONAL ON THE ROLLED-BACK FIRMWARE ACTUALLY REPUBLISHING, and that is worth
+ * stating because the paragraph above reads as unconditional. When v1 runs it retires the
+ * discriminator itself, and for that path the closure is total. But a v2 carrier left standing
+ * with NO live publisher — this process published and then died, or a later boot never reached
+ * dp_cap_publish() — still reads version 2 and still grants CAP_SFP. A version match cannot detect
+ * a dead process, and nothing in either build clears this window. MEASURED against the shipping
+ * host header: that case gives cap_check=OK and cap_has(SFP)=1.
+ * What prevents a send THERE is not this carrier and must not be attributed to it: the host gates
+ * OP_SFP behind DEBT #80's `diag` parameter AND `diag_armed`, and `diag_armed` is set only after a
+ * healthy bring-up — which a box with no live publisher does not have. Two further conditions,
+ * neither of them this word.
+ * The version bump is a dp_swop.h plus host-driver change, which is why nothing in this file may
+ * claim credit for it. This file's part
+ * is only to publish the bumped constant, which it does symbolically: slot[1] is
+ * DP_SWOP_CAP_VERSION, so the value follows the header and cannot drift from it here.
+ *
+ * THE ACCEPTED COST OF THAT BUMP — owner-ruled to be DOCUMENTED, not mitigated, and repeated here
+ * because this file is what publishes the 2. The mismatch is SYMMETRIC: an OLD host still speaking
+ * version 1, reading this NEW firmware's version 2, fails the same exact match and loses the WHOLE
+ * carrier — not just the SFP feature. OP_PORTS goes with it, so the host's switch port table and
+ * link_up telemetry go ABSENT on that box until it catches up. That is a TELEMETRY REGRESSION, not
+ * a wedge: nothing is sent, nothing hangs, no mains cycle is needed. It is deliberately the safe
+ * direction — losing telemetry until the two halves match costs an operator a reading; granting a
+ * capability to firmware that cannot answer costs a truck roll. The authoritative statement of
+ * this cost, and of what the host does with it, is in dp_swop.h; this is the publisher-side echo.
+ *
+ * WHAT THIS FILE ALONE COULD AND COULD NOT HAVE DONE, corrected — the previous wording said "NO
+ * CHANGE CONFINED TO THIS FILE CAN CLOSE IT" and that was FALSE. Deleting the slot[2] store is a
+ * one-line, forwarder.c-only change that closes the hazard completely: with no genuine tag ever
+ * written, a rolled-back v1 slot inherits nothing worth forging. It closes it by not shipping the
+ * capability at all, which is not a fix, it is a withdrawal. The true statement is the narrower
+ * one: NO CHANGE CONFINED TO THIS FILE CAN CLOSE IT WHILE STILL PUBLISHING THE CAPABILITY —
+ * because in the downgrade the OLD binary writes LAST, and the only words it writes are magic and
+ * version, both fixed constants a new build writes identically, so no value this build places
+ * anywhere in the window survives as a discriminator. The discriminator has to be a word the old
+ * binary rewrites, and that is the version, which lives in dp_swop.h.
+ *
+ * The self-validating tag never addressed this case and still does not: the stale word is not
+ * forged, it is ours. dp_cap_retract does not either — read the note there, its clear runs on no
+ * execution. The publish ordering below closes a different, intra-publish race.
  */
 static int dp_cap_fd = -1;
 static void *dp_cap_base;
@@ -1231,7 +1306,33 @@ static void dp_cap_retract(void)
 		return;
 	slot = (volatile uint32_t *)((char *)dp_cap_base +
 				     DP_SWOP_CAP_WINDOW_OFF + DP_SWOP_CAP_SLOT_OFF);
-	/* Magic first: a reader must never see a live magic beside a cleared version. */
+	/* Magic first: a reader must never see a live magic beside a cleared version.
+	 *
+	 * THIS CLEAR DOES NOT RUN ON ANY EXECUTION, AND IS NOT A MITIGATION FOR ANYTHING LEFT IN
+	 * THE WINDOW. dp_cap_retract has exactly one call site: the guest-handler registration
+	 * FAILURE branch in init_all_modules, which returns before the one and only
+	 * dp_cap_publish() call — and that publish holds the one and only assignment of
+	 * dp_cap_base (its mmap). dp_cap_base is a file-static, so it is zero at process start and
+	 * still NULL whenever we are reached; the guard above returns and the stores below are
+	 * skipped. This file installs no atexit, no on_exit and no signal handler, and
+	 * deinit_global calls only apps_pp2_deinit_global, so there is no second way in.
+	 * MEASURED in the emitted aarch64 (Bootlin gcc 7.3, the pinned toolchain): dp_cap_base
+	 * lives in .bss; the whole binary contains exactly two stores to it, both inside the
+	 * inlined publish on the registration-SUCCESS fall-through; and these retract stores sit
+	 * behind a `cbz` on dp_cap_base reached only by the mutually exclusive `cbnz` on the
+	 * registration return value.
+	 *
+	 * A `slot[2] = 0;` was added here and removed again for exactly that reason. It read as a
+	 * defence against a rolled-back v1 publisher inheriting our tagged feature word, and it is
+	 * not one — see THE DOWNGRADE HAZARD in the carrier note above, which is where that hazard
+	 * is recorded, and where the version bump that actually closes it is named. A guard that
+	 * cannot fire is worse than no guard: it is a missing guard that is trusted.
+	 *
+	 * The function is kept because it is correct for the day it acquires a call site that can
+	 * run with a live mapping. If you give it one, clear the FEATURE word here too, and revisit
+	 * THE DOWNGRADE HAZARD note — a retract that really runs changes what is true about the
+	 * window's contents after we exit, but only for the paths that reach it.
+	 */
 	slot[0] = 0;
 	__sync_synchronize();
 	slot[1] = 0;
@@ -1251,8 +1352,11 @@ static int dp_cap_publish(void)
 			PCI_EP_UIO_BAR0_NAME_STR);
 		return -1;
 	}
-	/* Refuse rather than write past the end of a window smaller than the contract assumes. */
-	if (len < DP_SWOP_CAP_WINDOW_OFF + DP_SWOP_CAP_SLOT_OFF + 8) {
+	/* Refuse rather than write past the end of a window smaller than the contract assumes.
+	 * The bound is the WHOLE slot, not the two v1 words: the host's own predicate refuses a
+	 * carrier shorter than SLOT_OFF + SLOT_LEN, so publishing into a window that fits only +8
+	 * would leave CAP_SFP unreadable no matter what we wrote into it. */
+	if (len < DP_SWOP_CAP_WINDOW_OFF + DP_SWOP_CAP_SLOT_OFF + DP_SWOP_CAP_SLOT_LEN) {
 		pr_warn("dp_app: swop capability NOT published — bar0 map is 0x%lx, too small for the slot\n",
 			len);
 		return -1;
@@ -1277,15 +1381,59 @@ static int dp_cap_publish(void)
 
 	slot = (volatile uint32_t *)((char *)dp_cap_base +
 				     DP_SWOP_CAP_WINDOW_OFF + DP_SWOP_CAP_SLOT_OFF);
-	/* Version first, magic second — the magic is the commit point, so a host that sees it is
-	 * guaranteed the version beside it is already the one that belongs to it. */
+	/* PUBLISH ORDER: CLEAR the magic, barrier, write version and features, barrier, COMMIT the
+	 * magic. This is dp_swop.h's requirement on the publisher, implemented literally.
+	 *
+	 * WHY THE CLEAR IS FIRST, and it is not cosmetic. The claim this comment used to make —
+	 * "the magic is the commit point, so a host that sees it is guaranteed the two words beside
+	 * it are already the ones that belong to it" — was true only of the FIRST publish after a
+	 * mains cycle. The NW_AGENT window is host-visible BAR0 memory and OUTLIVES a dp_fwd
+	 * restart; dp_cap_retract never clears it (its clear runs on no execution — read the note
+	 * there). So on a restart of a box that has published before, OUR OWN PREVIOUS MAGIC IS
+	 * ALREADY STANDING while slot[1] and slot[2] are being rewritten, and a host polling in that
+	 * interval reads a valid-looking carrier beside mid-update words. Zeroing slot[0] first, and
+	 * fencing before the rewrite, collapses that interval into "no carrier": zero is not
+	 * DP_SWOP_CAP_MAGIC, so a host holding to the contract reads nothing there and refuses
+	 * telemetry for that poll — a lost reading, which is the safe direction — instead of acting
+	 * on a half-written slot. Owner ruling, 2026-09-06.
+	 *
+	 * WHAT THE ORDERING NOW GUARANTEES, EXACTLY: any host that reads DP_SWOP_CAP_MAGIC at
+	 * slot[0] is reading a version and a feature word that were both stored before it, by this
+	 * process, in this publish. On every publish, not only the first.
+	 *
+	 * WHAT IT STILL DOES NOT GUARANTEE, AND CANNOT: that a handler is alive when the host reads.
+	 * A dp_fwd that publishes and then DIES leaves all three words standing with nothing behind
+	 * them, and no ordering can help — there is no clear on any exit path (no atexit, no
+	 * on_exit, no signal handler in this file; a crash would not run one anyway). The carrier
+	 * says "a handler was registered when these words were written", never "is registered now".
+	 * See WHAT THE CARRIER DOES NOT SAY in the block above.
+	 *
+	 * THE FEATURE WORD IS ON THE PRE-COMMIT SIDE for the same reason the version is, with a
+	 * worse cost if it slipped: were the magic visible first, the host could read a carrier
+	 * whose third word is still whatever the window held before us, a stale word carrying the
+	 * tag would forge CAP_SFP, the host would send OP_SFP to firmware it has no evidence can
+	 * answer, and one unanswered custom send strands the management channel — recovery is a
+	 * mains cycle (DEBT #80). The tag makes such a word improbable; this ordering removes the
+	 * interval in which OUR OWN publish could expose one.
+	 *
+	 * SCOPE: that is ALL this ordering does — the intra-publish race, within one process. The
+	 * downgrade case (a LATER v1 dp_fwd republishing over our magic and version, leaving our
+	 * feature word standing) is a different hazard and is closed by DP_SWOP_CAP_VERSION being 2,
+	 * not by anything here. slot[1] takes the constant symbolically, so the published version is
+	 * whatever dp_swop.h says and cannot drift from it in this file. See the carrier note above.
+	 */
+	slot[0] = 0;
+	__sync_synchronize();
 	slot[1] = DP_SWOP_CAP_VERSION;
+	slot[2] = (uint32_t)(((uint32_t)DP_SWOP_CAP_FEAT_TAG << 16) | DP_SWOP_CAP_SFP);
 	__sync_synchronize();
 	slot[0] = DP_SWOP_CAP_MAGIC;
 	__sync_synchronize();
-	pr_info("dp_app: swop capability published at bar0+0x%x (magic 0x%08x version %u) via %s map%d\n",
+	pr_info("dp_app: swop capability published at bar0+0x%x (magic 0x%08x version %u features 0x%08x) via %s map%d\n",
 		DP_SWOP_CAP_WINDOW_OFF + DP_SWOP_CAP_SLOT_OFF,
-		DP_SWOP_CAP_MAGIC, DP_SWOP_CAP_VERSION, dev, map_no);
+		DP_SWOP_CAP_MAGIC, DP_SWOP_CAP_VERSION,
+		(uint32_t)(((uint32_t)DP_SWOP_CAP_FEAT_TAG << 16) | DP_SWOP_CAP_SFP),
+		dev, map_no);
 	return 0;
 }
 
@@ -1405,8 +1553,13 @@ static int init_all_modules(void)
 	/* D84 #24-f: publish the capability HERE, on the success path of the registration that
 	 * installs the handler — see dp_swop.h. Publishing earlier would advertise a handler that
 	 * may not exist; publishing on failure would advertise one that certainly does not. A
-	 * publish failure is logged and left unpublished: the host then reads no capability and
-	 * refuses telemetry, which is the safe direction. */
+	 * publish failure is logged and left unpublished — but "unpublished" is NOT the same as
+	 * "absent", and only the first case below is the safe direction it looks like:
+	 *   - box that has NEVER published: the host reads no capability and refuses. Safe.
+	 *   - box that HAS published before: this window outlives a dp_fwd restart and nothing
+	 *     clears it, so the host reads the PREVIOUS image's carrier. A failed publish here
+	 *     leaves that standing rather than producing a clean absence, and what guards it is the
+	 *     host's `diag`/`diag_armed` gate, not this path. */
 	(void)dp_cap_publish();
 
 	return 0;

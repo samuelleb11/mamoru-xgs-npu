@@ -479,17 +479,58 @@ _Static_assert(offsetof(struct dp_swop_resp, sfp.data) == 28, "sfp.data moved");
  * rootfs survives host OTAs — so a `>=` test would let a FUTURE firmware that changes the
  * message shape open the gate for TODAY'S driver. Bump it on any shape change.
  *
- * ORDERING IS THE ATOMICITY. Publish writes the version first and the magic second, so a reader
- * that sees the magic is guaranteed a version already sits beside it. Retract clears the magic
- * first. There is no torn state in which the magic is present and the version is stale.
+ * ---- VERSION 2 (2026-09-06, owner ruling) --------------------------------------------------
+ *
+ * v1 published TWO words. v2 publishes THREE: the tagged feature word documented below. The bump
+ * is NOT because appending broke a v1 reader — it did not, words 0 and 1 keep their offsets,
+ * types and meanings — it is because THE VERSION IS THE ONLY WORD AN OLD FIRMWARE REWRITES, and
+ * that makes it the only thing capable of retiring a stale word a NEW firmware left behind.
+ *
+ * THE HAZARD IT CLOSES is a designed operation, not a thought experiment. BAR0 memory outlives a
+ * dp_fwd restart and is cleared only by a MAINS POWER CYCLE, and A/B OTA makes a firmware
+ * DOWNGRADE routine. Sequence: a v2 dp_fwd publishes magic + version + feature word; the box is
+ * rolled back; a v1 dp_fwd — which knows nothing of word 2 — republishes ONLY magic and version.
+ * Word 2 survives, still carrying the REAL tag 0x5343 and CAP_SFP, because WE wrote it, so the
+ * self-tag below cannot see anything wrong with it. A host matching only magic + version would
+ * read a genuine-looking grant, send OP_SFP to firmware with no handler, and one unanswered
+ * custom send STRANDS THE MANAGEMENT CHANNEL — recovery is a mains cycle (DEBT #80; it happened
+ * on 2026-09-02). With the bump, the rolled-back v1 firmware republishes version 1, the host's
+ * EXACT match refuses the whole carrier, and the stale feature word goes down with it. The
+ * closure is total rather than probabilistic: the old binary rewrites the discriminator itself,
+ * so no value any newer build placed in that window can outlive it.
+ *
+ * THE ACCEPTED COST — owner-ruled, to be DOCUMENTED rather than mitigated, and stated here
+ * because this is where a reader meets the constant. The mismatch is SYMMETRIC: an OLD host
+ * speaking version 1, against NEW firmware publishing version 2, now fails the same exact match
+ * and loses the WHOLE CARRIER — not merely the SFP feature. The host's `npu_swop_capable` goes
+ * false, so OP_PORTS is refused with it and the switch port table and `link_up` telemetry go
+ * ABSENT on that box until the host catches up. That is a TELEMETRY REGRESSION, not a wedge:
+ * nothing is sent, nothing hangs, no mains cycle is needed, and an operator can still re-arm the
+ * host's diagnostic path with its `diag` parameter. It is deliberately the safe direction —
+ * losing telemetry until the two halves match costs an operator a reading; granting a capability
+ * to firmware that cannot answer costs a truck roll.
+ *
+ * ORDERING IS THE ATOMICITY — A REQUIREMENT ON THE PUBLISHER, written as a requirement and not as
+ * an observation of any particular publisher. It must: CLEAR the magic, barrier, write version
+ * and features, barrier, write the magic LAST. Clearing FIRST is what makes the magic a commit
+ * point on EVERY publish rather than only the first one after a mains cycle — BAR0 memory
+ * survives a dp_fwd restart, so on a restart of a box that has published before, the magic is
+ * ALREADY LIVE while the words beside it are being rewritten.
+ *
+ * WHAT ORDERING DOES **NOT** BUY, stated so nothing here outruns the code: it says nothing about
+ * a publisher that has DIED. The carrier outlives the process that wrote it — a dp_fwd that
+ * publishes and then exits leaves magic, version and features standing with no handler behind
+ * them, and the host cannot tell that from a healthy box. Ordering makes the three words mutually
+ * consistent; it cannot make them CURRENT. The version match and the self-tag are the only
+ * defences, and neither detects a dead process.
  */
 #define DP_SWOP_CAP_WINDOW_OFF	0x4000u		/* NW_AGENT base within the host-visible BAR0 */
-/* Offset of the two-word slot inside that window. CONFIRM AGAINST A HARDWARE SURVEY before the
- * first publishing build ships: the host's `npu_capability` attribute lists every non-zero word
- * in the window, and this slot must land where nothing else writes. */
+/* Offset of the slot inside that window (v1: two words; v2: three). CONFIRM AGAINST A HARDWARE
+ * SURVEY before the first publishing build ships: the host's `npu_capability` attribute lists
+ * every non-zero word in the window, and this slot must land where nothing else writes. */
 #define DP_SWOP_CAP_SLOT_OFF	0x0000u
 #define DP_SWOP_CAP_MAGIC	0x53574f50u	/* "SWOP" */
-#define DP_SWOP_CAP_VERSION	1u
+#define DP_SWOP_CAP_VERSION	2u	/* v2 = 3-word slot; see the ruling above. Host matches EXACTLY. */
 
 /* ---- THE FEATURE WORD (third word of the slot) -------------------------------------------
  *
@@ -500,11 +541,12 @@ _Static_assert(offsetof(struct dp_swop_resp, sfp.data) == 28, "sfp.data moved");
  * SENDING — and one unanswered custom send is what stranded the management channel on 2026-09-02
  * and costs a mains cycle to clear (DEBT #80). The gate has to be readable PASSIVELY.
  *
- * WHY THE VERSION IS **NOT** BUMPED FOR IT, which looks like it contradicts the rule above. The
- * rule is that a change to the SHAPE OF WHAT v1 DEFINES must bump. This is an APPEND: words 0 and
- * 1 keep their offsets, types and meanings exactly, so a v1 reader reads precisely what it read
- * before and is not wrong about anything. **STILL BUMP** if any existing word changes meaning, or
- * if the slot ever shrinks or is reordered — append-only is the entire licence for not bumping.
+ * WHY THE VERSION **IS** BUMPED FOR IT — the full argument is in the carrier block above; this
+ * is the short form. The APPEND on its own would not need a bump: words 0 and 1 keep their
+ * offsets, types and meanings, so a v1 reader reads exactly what it read before. The DOWNGRADE
+ * needs it. A rolled-back v1 publisher rewrites only words 0 and 1 and leaves this word standing
+ * with a valid tag, so the version is the only word that can retire it. **ALSO BUMP** if any
+ * existing word ever changes meaning, or if the slot shrinks or is reordered.
  *
  * WHY THE WORD VALIDATES ITSELF. A v1 firmware publishes 8 bytes and leaves word 2 as whatever
  * the window already held. The 2026-09-03 survey read that window as exactly 2 non-zero words in
@@ -514,10 +556,9 @@ _Static_assert(offsetof(struct dp_swop_resp, sfp.data) == 28, "sfp.data moved");
  * bits only when (word >> 16) == DP_SWOP_CAP_FEAT_TAG. Zero fails it, all-ones (a PCIe UR read)
  * fails it, stale traffic fails it with probability 1 - 2^-16.
  *
- * PUBLISH ORDER — the magic is the commit point. Write the feature word BEFORE the magic, exactly
- * as the version already is (forwarder.c: slot[1] then a barrier then slot[0]); the feature word
- * becomes slot[2] and is written alongside slot[1]. Retract clears the magic first. There is no
- * torn state in which a reader sees the magic beside a feature word that does not belong to it.
+ * PUBLISH ORDER — the magic is the commit point, and the full requirement (clear the magic FIRST,
+ * then version and features, then the magic last) is stated in the carrier block above. The
+ * feature word is written on the same side of the barrier as the version, never after the magic.
  * And the publisher's own size refusal must widen from +8 to +DP_SWOP_CAP_SLOT_LEN, or it writes
  * past the end of a window that is big enough for v1 and not for this.
  */
