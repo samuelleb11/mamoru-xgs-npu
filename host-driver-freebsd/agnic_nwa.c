@@ -61,6 +61,17 @@
  */
 #define	NWA_CFG_READY_MAGIC_OFF		0x00	/* == 0xCAFEBABE when NPU up */
 #define	NWA_CFG_READY_MAGIC		0xCAFEBABEU
+/*
+ * "SWOP" -- the capability magic this kit's dp_fwd publishes in the same window
+ * (npu-firmware/src/dp_swop.h, DP_SWOP_CAP_MAGIC). dp_fwd REPLACES the vendor
+ * NetAgent that serves NW_AGENT, so when this is what the window holds, the
+ * CAFEBABE poll below can never succeed: it is not a slow NPU, it is a different
+ * NPU firmware. Recognising it turns a 24-second stall ending in "abort" into an
+ * immediate, correctly-labelled skip -- and prints the capability version, which
+ * is the one field that tells an operator WHICH dp_fwd generation is running.
+ */
+#define	NWA_CFG_SWOP_MAGIC		0x53574F50U
+#define	NWA_CFG_SWOP_VERSION_OFF	0x04
 #define	NWA_CFG_COOKIE_OFF		0x04	/* == 0x34 when cfg published */
 #define	NWA_CFG_COOKIE			0x34U
 #define	NWA_CFG_PAYLOAD_OFF_OFF		0x04	/* cmd payload = window + [0x04] */
@@ -569,6 +580,15 @@ agnic_nwa_bringup(struct agnic_softc *sc)
 		printf("\n");
 		if (nwa_rd(sc, NWA_CFG_READY_MAGIC_OFF) == NWA_CFG_READY_MAGIC)
 			break;
+		if (nwa_rd(sc, NWA_CFG_READY_MAGIC_OFF) == NWA_CFG_SWOP_MAGIC) {
+			device_printf(dev,
+			    "P4a: NPU runs this kit's dp_fwd (SWOP capability "
+			    "v%u), which does not serve NW_AGENT; skipping "
+			    "per-port PHY control. Front-panel link state is "
+			    "unavailable -- this is expected, not a failure.\n",
+			    nwa_rd(sc, NWA_CFG_SWOP_VERSION_OFF));
+			return (ENXIO);
+		}
 		pause("nwardy", NWA_READY_STEP_MS * hz / 1000);
 	}
 	if (nwa_rd(sc, NWA_CFG_READY_MAGIC_OFF) != NWA_CFG_READY_MAGIC) {
