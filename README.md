@@ -1,8 +1,9 @@
 # mamoru-xgs-npu
 
 An open host driver and a minimal NPU firmware that bring the front ports of a Sophos XGS
-appliance up under an OS of your choice, instead of Sophos Firewall OS. IPFire/Linux works
-today; pfSense/OPNsense (FreeBSD) requires finishing work.
+appliance up under an OS of your choice, instead of Sophos Firewall OS. IPFire/Linux and
+OPNsense/FreeBSD both carry front-panel traffic today; see [Status](#status) for what each
+has actually been measured doing.
 
 The XGS is an x86 host plus a Marvell CN9130 "NPU" (ARM) plus an 88E6193X switch, connected
 over PCIe. The front jacks are not normal NICs: they hang off the switch, the NPU multiplexes
@@ -74,7 +75,7 @@ board is the main risk this kit carries.
 |---|---|---|
 | Linux host driver | **Measured** | Clean-room and self-contained; builds out-of-tree and carries traffic on the XGS 116 |
 | FreeBSD host driver — control plane | **Measured** | bind → BARs → MSI-X → mailbox → mgmt echo, on 116 hardware |
-| FreeBSD host driver — RX/TX datapath | **Unverified** | Written; not yet verified end to end |
+| FreeBSD host driver — RX/TX datapath | **Measured** | End to end on the 116 under OPNsense 26.7 / FreeBSD 15.1: front jack → switch → NPU → GIU trunk → host `port1` → ICMP reply, zero drops either direction. Against the **shipped** `dp_fwd` payload; a `forwarder.c` you build yourself is a different, untested binary |
 | NPU firmware (`dp_fwd` + switch-init) | **Measured** | Clean-room switch-init and `dp_fwd` carry real traffic on the 116: front jack → VLAN 30 → host `portN` → DHCP lease |
 | NPU rootfs replacement | **Not attempted** | Reaching the NPU over the management link is measured on two XGS 116 units (2026-09-04 and 2026-07-29); no rootfs has been installed through that path end to end |
 
@@ -136,7 +137,8 @@ rootfs of your own, which is the rootfs replacement in
 |---|---|---|
 | [`host-driver-linux/`](host-driver-linux/) | Linux kernel module (IPFire, or any Linux) | GPL-2.0 OR MIT |
 | [`host-driver-linux/tools/`](host-driver-linux/tools/) | `npc.sh`, the NPU serial-console helper on the host's `ttyS2` | MIT |
-| [`host-driver-freebsd/`](host-driver-freebsd/) | FreeBSD `if_agnic` driver (pfSense/OPNsense); control plane Measured, datapath Unverified | BSD-2-Clause |
+| [`host-driver-freebsd/`](host-driver-freebsd/) | FreeBSD `if_agnic` driver (pfSense/OPNsense); control plane and datapath both Measured | BSD-2-Clause |
+| [`host-driver-freebsd/tools/`](host-driver-freebsd/tools/) | `npc.py`, the NPU serial-console helper on the host's `cuau2` | BSD-2-Clause |
 | [`npu-firmware/src/`](npu-firmware/src/) | Clean-room wire-contract headers, the `dp_app` skeleton, and the `dp_swop` switch-register handler with its host-side unit test | MIT |
 | [`npu-firmware/forwarder/`](npu-firmware/forwarder/) | `dp_fwd` source (`forwarder.c`); Marvell, with the quarantine rules in [that directory's README](npu-firmware/forwarder/README.md) | GPL-2.0 |
 | [`npu-firmware/switch-init/`](npu-firmware/switch-init/) | Native 88E6193X bring-up; replaces the proprietary init | MIT |

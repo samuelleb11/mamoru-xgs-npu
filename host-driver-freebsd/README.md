@@ -14,15 +14,21 @@ transcribed from it, and the three ABI headers here, `agnic_barmap.h`, `agnic_ct
 | Half | State | Evidence |
 |---|---|---|
 | Control plane | **Measured** | PCI bind, BAR0/2/4 map, 36-bit `bus_dma`, MSI-X, barmap read-back, two-way mailbox and the `CC_PF_MGMT_ECHO` round-trip, on XGS 116 hardware |
-| RX/TX datapath, buffer pool and per-port demux | **Unverified** | Written; not run end to end |
+| RX/TX datapath, buffer pool and per-port demux | **Measured** | 2026-09-16, XGS 116 on OPNsense 26.7 / FreeBSD 15.1-RELEASE-p1: ICMP round trip from a laptop on front port 1 through the switch, the NPU and the GIU trunk to `port1` and back, 4/4 at 0.5 ms; 422 RX frames and 13 TX with `rx_dropped`/`tx_dropped` both 0 |
 
 The MSI-X table lives in BAR0 at 0x1000, where the firmware ABI puts it, and maps cleanly. The
 barmap read-back returns cookie `0xd0fac10d` and version `0x00000005`.
 
-Unverified on the datapath: the `CC_PF_INIT…ENABLE` sequence, the buffer-pool refill, the MSI-X
-kick and its poll fallback, and the 66-byte pport tag demux. Cross-check each against the Linux
-[`agnic_txrx.c`](../host-driver-linux/agnic_txrx.c) and
-[`agnic_pport.c`](../host-driver-linux/agnic_pport.c), which are traffic-proven.
+The `CC_PF_INIT…ENABLE` sequence, the buffer-pool refill, the MSI-X kick with its poll fallback and
+the 66-byte pport tag demux all ran end to end in that test, and `dev.agnic.0.rx_prod`/`rx_cons`/
+`bp_prod`/`bp_cons` tracked each other throughout.
+
+**What that measurement does NOT cover.** It was taken against the `dp_fwd` this repository ships
+(`npu-firmware/deploy/payload/`, md5 `35c35a3c19311efd2b529a7693e76cd4`, built 2026-07-31), which
+publishes SWOP capability **v1**. `npu-firmware/src/dp_swop.h` is at `CAP_VERSION 2`, and
+[../docs/BUILD.md](../docs/BUILD.md) Part B tells you to cross-build `forwarder.c` — which produces
+a v2 binary that has never been run against this driver. If you build your own `dp_fwd`, you are
+past the edge of what is measured here; the shipped payload is the tested artefact.
 
 The driver labels its log lines by phase: `[Phase 1+2a]` at attach, then `P2b`, `P3a`, `P3b`, `P4a`,
 `P4b` and `P4c`. `P5`, the `mvmgmt0` bring-up, runs inside the P2b handshake, so its lines can
