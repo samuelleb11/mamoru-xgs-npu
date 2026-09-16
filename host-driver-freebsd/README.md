@@ -39,8 +39,22 @@ adjustments on 14.
 ```sh
 make                                              # -> if_agnic.ko
 sudo kldload ./if_agnic.ko
-echo 'if_agnic_load="YES"' >> /boot/loader.conf   # persist across boot
 ```
+
+Persist it across boot **only once it has attached cleanly on your box**:
+
+```sh
+echo 'if_agnic_load="YES"' >> /boot/loader.conf
+```
+
+While you are still bringing the driver up, `kldload` it by hand every time. A panic on the
+attach path is one reboot away from a clean box if the module is loaded manually, and a **boot
+loop** if `loader.conf` loads it before you get a prompt — on an appliance whose only console may
+be a serial header inside the chassis. The same applies after any change to the NPU firmware it
+talks to.
+
+On OPNsense, `opnsense-code src` fetches the matching source tree, so the module can be built on
+the appliance itself; that guarantees it matches the running kernel exactly.
 
 Both halves of the kit, host driver and NPU firmware, are built in
 [../docs/BUILD.md](../docs/BUILD.md).
