@@ -28,7 +28,12 @@
 # Do not reorder these steps. If you add a port, add it to the map loop, not just to phyup.
 # Override the refusal with SW_ISO_ENFORCE=0 only if you know why you are doing it.
 # =========================================================================================
-SW=${SW:-/opt/dp/swmdio.sh}
+# swmdio.sh is this script's SIBLING, so resolve it relative to $0 rather than to a
+# hardcoded /opt/dp. The kit is routinely run from somewhere else: a factory NPU's rootfs
+# is mounted read-only, so /opt/dp cannot be written and the deploy is staged in /tmp
+# instead (docs/NPU-INSTALL.md). With the old default, `DP=/tmp/dp sh dp-autostart.sh`
+# copied everything to /tmp/dp and then reached back to a /opt/dp that does not exist.
+SW=${SW:-"$(dirname "$0")/swmdio.sh"}
 ISO_ENFORCE=${SW_ISO_ENFORCE:-1}
 
 w() { sh "$SW" wr "$@" >/dev/null 2>&1; }

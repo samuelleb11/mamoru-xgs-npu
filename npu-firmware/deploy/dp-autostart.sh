@@ -22,9 +22,22 @@ cd "$DP"
 # --- 1. Marvell UIO modules. These are GPL-2.0 Marvell kernel modules ALREADY on
 #        your XGS's NPU rootfs (lib/modules/.../extra/) — we ship nothing here; we
 #        load your box's own copies. See docs/VENDOR-BITS.md. ---
-insmod musdk_cma.ko    2>/dev/null || echo "[dp-autostart] musdk_cma.ko: already loaded or not found"
-insmod mv_dmax2_uio.ko 2>/dev/null || echo "[dp-autostart] mv_dmax2_uio.ko: already loaded or not found"
-insmod uio_pdrv_genirq.ko of_id=generic-uio 2>/dev/null || true
+#
+# Look for each module in $DP first, then on the NPU's own rootfs. A deploy staged in
+# /tmp (the only writable place on a factory NPU) contains dp_fwd and the kit's scripts
+# but NOT the .ko files -- those are the vendor's, they are already installed under
+# /lib/modules, and we deliberately ship none. Loading only from the current directory
+# therefore worked for /opt/dp and silently failed everywhere else.
+load_uio() {
+	_m=$1; shift
+	if [ -f "$DP/$_m" ] && insmod "$DP/$_m" "$@" 2>/dev/null; then return 0; fi
+	_p=$(find /lib/modules -name "$_m" 2>/dev/null | head -1)
+	if [ -n "$_p" ] && insmod "$_p" "$@" 2>/dev/null; then return 0; fi
+	echo "[dp-autostart] $_m: already loaded or not found"
+}
+load_uio musdk_cma.ko
+load_uio mv_dmax2_uio.ko
+load_uio uio_pdrv_genirq.ko of_id=generic-uio
 
 # --- 2. Native switch bring-up (clean-room; replaces xgs-mvl6193-init). ---
 #
@@ -48,4 +61,20 @@ sh "$DP/sw-init.sh"
 
 # --- 3. Hand the datapath to dp_fwd (built from forwarder.c against MUSDK).
 #        -g 2 GIU id, -i eth0 host-trunk netdev, -f nmp config. ---
+#
+# TWO THINGS THIS SCRIPT CANNOT DO FOR YOU, both of which apply when you are taking a
+# FACTORY NPU over rather than booting a rootfs that already runs this kit:
+#
+#   1. The vendor data plane owns eth0 and the GIU. If it is still running, dp_fwd cannot
+#      bind and exits. Stop it before you get here. (Its process name is the vendor's, not
+#      ours, so this script does not guess at it and will not kill something on your
+#      appliance by name-matching.)
+#
+#   2. The HOST must re-drive its side afterwards. The host publishes its AGNIC management
+#      rings ONCE, at P3, and the NPU latches them when dp_fwd starts -- so a dp_fwd that
+#      starts after the host driver is already up has no path back to it. Reload the host
+#      driver once this is running: `kldunload if_agnic; kldload if_agnic` on FreeBSD,
+#      `rmmod mamoru_agnic; insmod mamoru_agnic.ko` on Linux. See dp-swap-guarded.sh for
+#      the measurement behind this.
+echo "[dp-autostart] starting dp_fwd from $DP; now reload the host driver so it re-drives P3"
 exec env LD_LIBRARY_PATH=/lib:/usr/lib ./dp_fwd -g 2 -i eth0 -c 1 -a 1 -f dp-nmp-config.txt --no-stat
