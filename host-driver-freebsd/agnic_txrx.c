@@ -1139,6 +1139,7 @@ agnic_rx_service(struct agnic_softc *sc)
 		uint16_t len = d->byte_cnt;
 		struct agnic_rxbuf *rb;
 		struct mbuf *m;
+		uint32_t trim;
 
 		guard++;
 
@@ -1155,7 +1156,16 @@ agnic_rx_service(struct agnic_softc *sc)
 		}
 		rb = &bp->rxb[(uint32_t)cookie];
 		m = rb->m;
-		if (m == NULL || len == 0 || len > bp->buf_size) {
+		/*
+		 * trim is what m_adj() removes below; len is what we then declare
+		 * as m_len. If trim + len exceeds the cluster, m_len would run past
+		 * the end of the buffer -- so the SUM has to be checked, not len
+		 * alone. The Linux driver checks it (agnic_txrx.c, "trim + len >
+		 * AGNIC_RX_CLSIZE"); this side had only the len half.
+		 */
+		trim = sc->host_headroom + d->pkt_offset;
+		if (m == NULL || len == 0 || len > bp->buf_size ||
+		    trim + len > bp->buf_size) {
 			sc->rx_dropped++;
 			if (m != NULL) {
 				bus_dmamap_sync(bp->buf_tag, rb->map,
@@ -1171,9 +1181,9 @@ agnic_rx_service(struct agnic_softc *sc)
 		bus_dmamap_unload(bp->buf_tag, rb->map);
 		rb->m = NULL;
 
-		/* Trim to the real frame start + length. */
-		if (sc->host_headroom + d->pkt_offset > 0)
-			m_adj(m, sc->host_headroom + d->pkt_offset);
+		/* Trim to the real frame start + length (bounds-checked above). */
+		if (trim > 0)
+			m_adj(m, trim);
 		m->m_len = m->m_pkthdr.len = len;
 		m->m_pkthdr.rcvif = NULL;	/* pport demux sets the real port */
 		m->m_nextpkt = NULL;
