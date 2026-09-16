@@ -85,6 +85,7 @@ static void	agnic_rx_task(void *ctx, int pending);
 static void	agnic_rx_service(struct agnic_softc *sc);
 static void	agnic_bp_refill_locked(struct agnic_softc *sc, uint32_t n);
 static void	agnic_txrx_free_rings(struct agnic_softc *sc);
+static int	agnic_sysctl_idx(SYSCTL_HANDLER_ARGS);
 
 /* ------------------------------------------------------------------------- */
 /* Ring + buffer-pool allocation.                                            */
@@ -524,6 +525,31 @@ agnic_txrx_config_queues(struct agnic_softc *sc)
  * hex-dumps; tx_hdr_mode/tx_hdr_magic/tx_pkt_offset let us discover the pport
  * TX format the NPU accepts without a rebuild per attempt.
  */
+/*
+ * Read one of the six ring index words live out of BAR0. Bumping an index word
+ * IS the doorbell (see the file header), so these four numbers say exactly where
+ * a stalled datapath stopped, and which SIDE stopped it:
+ *
+ *   bp_cons == 0                  the NPU has not taken a single host RX buffer;
+ *                                 nothing upstream is producing. Not a host bug.
+ *   bp_cons > 0, rx_prod == 0     the NPU took buffers but posted no completions.
+ *   rx_prod > 0, rx_frames == 0   completions arrived and HOST servicing dropped
+ *                                 them -- the only case that indicts this driver.
+ *
+ * Without these, "rx_frames: 0" is indistinguishable across all three, which is
+ * exactly the ambiguity that made issue #1 hard to triage from the host side.
+ */
+static int
+agnic_sysctl_idx(SYSCTL_HANDLER_ARGS)
+{
+	struct agnic_softc *sc = (struct agnic_softc *)arg1;
+	u_int val = 0;
+
+	if (sc->txrx_inited)
+		val = (u_int)AGNIC_RD4(sc, AGNIC_BAR0, (uint32_t)arg2);
+	return (sysctl_handle_int(oidp, &val, 0, req));
+}
+
 static void
 agnic_add_sysctls(struct agnic_softc *sc)
 {
@@ -553,6 +579,24 @@ agnic_add_sysctls(struct agnic_softc *sc)
 	    &sc->tx_pkt_offset, 0, "TX descriptor pkt_offset (0 default)");
 	SYSCTL_ADD_INT(ctx, ch, OID_AUTO, "rx_last_hdr_valid", CTLFLAG_RD,
 	    &sc->rx_last_hdr_valid, 0, "a real RX pport header has been captured");
+
+	/* Live ring indices straight out of BAR0 -- see agnic_sysctl_idx(). */
+	SYSCTL_ADD_PROC(ctx, ch, OID_AUTO, "rx_prod",
+	    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc,
+	    sc->rx_ring.prod_bar_off, agnic_sysctl_idx, "IU",
+	    "RX ring producer index (DEVICE writes; 0 = NPU produced nothing)");
+	SYSCTL_ADD_PROC(ctx, ch, OID_AUTO, "rx_cons",
+	    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc,
+	    sc->rx_ring.cons_bar_off, agnic_sysctl_idx, "IU",
+	    "RX ring consumer index (HOST writes)");
+	SYSCTL_ADD_PROC(ctx, ch, OID_AUTO, "bp_prod",
+	    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc,
+	    sc->bp_ring.prod_bar_off, agnic_sysctl_idx, "IU",
+	    "bpool producer index (HOST writes; free buffers offered)");
+	SYSCTL_ADD_PROC(ctx, ch, OID_AUTO, "bp_cons",
+	    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc,
+	    sc->bp_ring.cons_bar_off, agnic_sysctl_idx, "IU",
+	    "bpool consumer index (DEVICE writes; 0 = NPU took no buffers)");
 }
 
 /* ------------------------------------------------------------------------- */
